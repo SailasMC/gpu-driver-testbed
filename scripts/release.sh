@@ -20,7 +20,7 @@ git remote set-url origin "$AUTH" 2>/dev/null || git remote add origin "$AUTH"
 git push -q origin HEAD:main --tags
 echo "==> 建 Release v$V"
 python3 - "$V" "$NOTE" "$APK" <<'PY'
-import sys, json, urllib.request
+import sys, json, urllib.request, urllib.error
 V, NOTE, APK = sys.argv[1], sys.argv[2], sys.argv[3]
 cfg = open("/root/repo-verify/.git/config").read()
 import re
@@ -32,7 +32,6 @@ def api(path, method="GET", payload=None, raw=None, ctype=None):
     h = dict(H)
     if ctype: h["Content-Type"] = ctype
     r = urllib.request.Request("https://api.github.com" + path, data=data, headers=h, method=method)
-    import urllib.error
     try:
         with urllib.request.urlopen(r, timeout=60) as resp: return resp.status, json.load(resp) if resp.headers.get("content-type","").startswith("application/json") else {}
     except urllib.error.HTTPError as e:
