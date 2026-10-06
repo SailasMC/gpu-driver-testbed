@@ -313,6 +313,12 @@ public class MainActivity extends Activity {
             final int idx = i;
             Button t = new Button(this);
             t.setText(TAB_NAMES[i]);
+            /* v5.4：页签图标（按名字匹配，不依赖页签顺序 ✓）*/
+            int ic = tabIconRes(TAB_NAMES[i]);
+            if (ic != 0) {
+                t.setCompoundDrawablesWithIntrinsicBounds(0, ic, 0, 0);
+                t.setCompoundDrawablePadding(dp(2));
+            }
             t.setAllCaps(false);
             t.setTextSize(12);
             t.setPadding(0, dp(2), 0, dp(2));
@@ -382,6 +388,21 @@ public class MainActivity extends Activity {
             tabPages[i].setVisibility(i == idx ? View.VISIBLE : View.GONE);
             styleTab(tabBtns[i], i == idx);
         }
+    }
+
+    /* v5.4：页签图标映射（按名字，顺序无关；用 getIdentifier 而不依赖 R —— 免 Gradle 构建未生成 R.java）*/
+    private int tabIconRes(String n) {
+        String nm = null;
+        if (n == null) return 0;
+        if (n.contains("概览")) nm = "ic_tab_overview";
+        else if (n.contains("驱动")) nm = "ic_tab_driver";
+        else if (n.contains("测试")) nm = "ic_tab_test";
+        else if (n.contains("画面")) nm = "ic_tab_render";
+        else if (n.contains("压力")) nm = "ic_tab_stress";
+        else if (n.contains("跑分")) nm = "ic_tab_bench";
+        else if (n.contains("日志")) nm = "ic_tab_log";
+        if (nm == null) return 0;
+        return getResources().getIdentifier(nm, "drawable", getPackageName());
     }
 
     private void styleTab(Button t, boolean on) {

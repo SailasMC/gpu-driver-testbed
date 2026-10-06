@@ -9,6 +9,16 @@ KS=/root/gputest.keystore
 NDK=$(ls -d /opt/android-sdk/ndk/*/ | head -1)
 CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
 
+# --- v5.4: 先生成 R.java，Java 才能引用 res/ 里的图标 ---
+BT=${BT:-/opt/android-sdk/build-tools/35.0.0}
+echo "==> [0/7] 生成 R.java"
+"$BT/aapt2" compile --dir "$SRC/res" -o "$W/res.zip" >/dev/null 2>&1 || true
+mkdir -p "$W/gen"
+"$BT/aapt2" link -o "$W/base_gen.apk" -I "$PLATFORM" --manifest "$SRC/AndroidManifest.xml" \
+    --java "$W/gen" "$W/res.zip" >/dev/null 2>&1 || echo "  ! R.java 生成失败"
+RJ=$(find "$W/gen" -name R.java 2>/dev/null | head -1)
+if [ -n "$RJ" ]; then echo "$RJ" >> "$W/srcs.txt"; echo "  ✓ R.java 已加入编译源"; else echo "  ! 没找到 R.java"; fi
+
 echo "==> [1/7] javac --release 11"
 find "$SRC/src" -name '*.java' > "$W/srcs.txt"
 javac -nowarn --release 11 -d "$W/classes" -cp "$PLATFORM" @"$W/srcs.txt" 2>&1 | grep -v "^Note:" || true
