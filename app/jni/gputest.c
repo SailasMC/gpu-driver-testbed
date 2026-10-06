@@ -557,11 +557,18 @@ static void bench_report(const char *label, BenchStat *b) {
         LOG("（本次有失败 ⇒ 不输出吞吐数字，失败率才是结论）\n");
         return;
     }
+    /* v6.0：成绩**只用 GPU 时间**（分母 = GPU 秒）—— 墙钟含 CPU 提交往返，
+     * 拿它当成绩会让"CPU 慢"被误读成"GPU 慢" ✗ */
+    double den = (b->gpu_ok && b->gpu_ms > 0) ? b->gpu_ms / 1000.0 : dt;
+    if (b->gpu_ok && b->gpu_ms > 0)
+        LOG("※ 以下成绩按 **GPU 时间** 计（不含 CPU 提交往返）\n");
+    else
+        LOG("※ 该驱动无 GPU 时间戳 ⇒ 成绩只能按墙钟计（含 CPU 影响，仅供参考）\n");
     if (b->pixels_per_op > 0)
         LOG("吞吐=%.1f Mpixel/s  (%.2f Gpixel/s)\n",
-            b->ops * b->pixels_per_op / 1e6 / dt, b->ops * b->pixels_per_op / 1e9 / dt);
+            b->ops * b->pixels_per_op / 1e6 / den, b->ops * b->pixels_per_op / 1e9 / den);
     if (b->bytes_per_op > 0)
-        LOG("有效带宽=%.2f GB/s（已按「读+写」计；单看一侧要除以 2）\n", b->ops * b->bytes_per_op / 1e9 / dt);
+        LOG("有效带宽=%.2f GB/s（已按「读+写」计；单看一侧要除以 2）\n", b->ops * b->bytes_per_op / 1e9 / den);
 }
 
 // fill：全屏三角形 + 可放大片元负载（**不是** vkCmdClearColorImage —— 清屏不是填充测试）
@@ -687,7 +694,7 @@ static int bench_blit(Ctx *c, Target *a, Target *b, double seconds, BenchStat *s
     if (submit_wait(c, a) != VK_SUCCESS) { LOG("X blit 预热失败\n"); return 0; }
     VkImageCopy region = { sl, { 0, 0, 0 }, sl, { 0, 0, 0 }, { a->W, a->H, 1 } };
     Timer tm; int has_ts = timer_init(c, &tm, 2);     /* v4.2: GPU 时间戳 */
-    const int per = 64;    /* v3.1：同上 */
+    const int per = 256;    /* v6.0：再放大，压缩 CPU 提交占比 */
     double t0 = now_ms(), deadline = t0 + seconds * 1000.0;
     st->bytes_per_op = (double) a->W * a->H * 4.0 * 2.0;   /* v4.3: 有效字节 = 读+写（vkpeak 口径）*/
     while (now_ms() < deadline) {
@@ -721,7 +728,7 @@ static int bench_draw(Ctx *c, Target *t, VkPipeline pipe, VkPipelineLayout pl,
     VkRenderPassBeginInfo rpbi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
         .renderPass = t->rp, .framebuffer = t->fb, .renderArea = { { 0, 0 }, { t->W, t->H } },
         .clearValueCount = 1, .pClearValues = &cv };
-    const int draws_per_submit = 512;   /* v3.1：同上 */
+    const int draws_per_submit = 4096;   /* v3.1：同上 */
     Timer tm; int has_ts = timer_init(c, &tm, 2);     /* v4.2: GPU 时间戳 */
     double t0 = now_ms(), deadline = t0 + seconds * 1000.0;
     st->pixels_per_op = 0;   /* v2.0(B9)：draw 的语义是"三角形/秒"，不是像素率 */
