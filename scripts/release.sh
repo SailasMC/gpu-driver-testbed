@@ -4,6 +4,10 @@
 set -e
 V="$1"; NOTE="${2:-发布 v$V}"
 [ -n "$V" ] || { echo "用法: bash scripts/release.sh <版本> [说明]"; exit 1; }
+case "$V" in
+  *.0) : ;;
+  *) echo '✗ 只发大版本（X.0）到 GitHub；当前是小版本 ⇒ 请只在本机/手机测试' >&2; exit 2 ;;
+esac
 cd "$(dirname "$0")/.."                     # 保证在仓库根
 echo "==> [1/4] 构建 v$V"
 bash /root/mk.sh "$V" | tail -5
