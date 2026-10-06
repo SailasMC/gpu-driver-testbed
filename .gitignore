@@ -1,0 +1,6 @@
+build/
+appbuild/
+*.apk
+*.o
+*.so
+!app/jni/glsl/*.spv
