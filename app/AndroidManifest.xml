@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.dsh.gputest"
-    android:versionCode="61"
-    android:versionName="6.1">
+    android:versionCode="96400"
+    android:versionName="9.64">
 
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
@@ -14,6 +14,15 @@
     <application android:label="GPU 驱动测试台"
                  android:icon="@mipmap/ic_launcher"
                  android:debuggable="false">
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="com.dsh.gputest.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+
         <activity android:name=".MainActivity"
                   android:exported="true"
                   android:configChanges="orientation|screenSize|keyboardHidden">

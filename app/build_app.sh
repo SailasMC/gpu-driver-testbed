@@ -34,8 +34,14 @@ echo "    OK: classes.dex $(stat -c%s "$W/dex/classes.dex") 字节"
 echo "==> [3/7] NDK 编译原生模块"
 if [ -f "$SRC/jni/gputest.c" ]; then
   "$CC" -shared -O2 -fPIC -DVK_NO_PROTOTYPES -o "$W/lib/arm64-v8a/libgputest.so" \
-        "$SRC/jni/gputest.c" -llog -ldl -ljnigraphics 2>&1 | head -14
+        "$SRC/jni/gputest.c" -llog -ldl -ljnigraphics -lm 2>&1 | head -14
   [ -f "$W/lib/arm64-v8a/libgputest.so" ] || { echo "X 原生编译失败"; exit 1; }
+# 自检：未解析的外部符号必须在 libc/libdl 等基础库里 ⇒ 否则运行期 loadLibrary 会直接失败（不写日志、无崩溃文件 ✗）
+NM=$(ls /opt/android-sdk/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm 2>/dev/null | head -1)
+if [ -n "$NM" ] && [ -x "$NM" ]; then
+  BAD=$("$NM" -D --undefined-only "$W/lib/arm64-v8a/libgputest.so" 2>/dev/null | awk '{print $2}' | grep -v '@' | grep -v '^$' | tr '\n' ' ')
+  if [ -n "$BAD" ]; then echo "  ! 未解析符号（非 libc/libdl 版本化符号）: $BAD"; fi
+fi
   echo "    OK: libgputest.so $(stat -c%s "$W/lib/arm64-v8a/libgputest.so") 字节"
 else
   echo "    (跳过：无 jni/gputest.c)"; exit 1
@@ -64,6 +70,19 @@ zz = zipfile.ZipFile("unsigned.apk")
 names = zz.namelist()
 print("    包内条目:", [n for n in names if n.endswith('.dex') or n.endswith('.so')])
 assert "classes.dex" in names and so in names, "装载不完整"
+PY
+
+echo "==> [5.5/7] 装入驱动插件需要的系统私有库（libcutils 等 ✓ 应用 lib 目录优先 ✓）"
+python3 - <<'PY'
+import zipfile, os, glob
+apk = "unsigned.apk"
+if os.path.exists(apk):
+    z = zipfile.ZipFile(apk, 'a', zipfile.ZIP_DEFLATED)
+    n = 0
+    for p in sorted(glob.glob("/root/extralibs/*.so")) if os.path.isdir("/root/extralibs") else []:
+        z.write(p, "lib/arm64-v8a/" + os.path.basename(p)); n += 1
+    z.close()
+    print("    已装入 %d 个系统库" % n)
 PY
 
 echo "==> [6/7] zipalign"

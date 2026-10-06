@@ -11,12 +11,20 @@
 #include <time.h>
 #include <vulkan/vulkan.h>
 #include "shaders.h"
+#include "shaders_lit.h"
+#include "shaders_rt.h"   /* 光追 ray_query 计算着色器，已编进 .so ✓ */   /* v7.0：光影四段着色器，已编进 .so ✓ */
+#include "shaders_lit2.h"   /* v7.8：动态 PCF + 线性输出 + 后处理开关 */
+#include "shaders_mini3d.h"   /* v9.11：迷你 3D 自转立方体的 SPIR-V ✓ */
 #include <android/bitmap.h>
 #include <elf.h>
+#include <math.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <ucontext.h>   /* v9.6: ucontext_t ⇒ 崩溃现场的 PC/SP/LR（原先被丢弃 ✗）✓ */
+#include <unwind.h>
+#include <dlfcn.h>
 #include <unistd.h>
 #include <errno.h>   /* v2.0: 直接往 Java Bitmap 里写像素（画面页） */
 
@@ -62,6 +70,15 @@ static PFN_gipa icd_open(const char *path, void **handle) {
         return gipa;
     }
     LOG("[1] dlopen(%s)\n", path);
+    /* v6.5：有些驱动插件链接了**系统私有库**（如 libcutils.so）—— 应用命名空间默认不给 ✗
+     * ⇒ 先把它们按绝对路径以 RTLD_GLOBAL 载入，插件随后就能解析到（best-effort，失败不致命）*/
+    static const char *PRE[] = { "/system/lib64/libcutils.so", "/system/lib64/liblog.so",
+                                 "/system/lib64/libbase.so", "/system/lib64/libutils.so",
+                                 "/system/lib64/libnativewindow.so", "/system/lib64/libsync.so", NULL };
+    for (int i = 0; PRE[i]; i++) {
+        void *p = dlopen(PRE[i], RTLD_NOW | RTLD_GLOBAL);
+        if (p) LOG("  （预载 %s 成功）\n", PRE[i]);
+    }
     void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!h) { LOG("    X %s\n", dlerror()); return NULL; }
     PFN_neg neg = (PFN_neg) dlsym(h, "vk_icdNegotiateLoaderICDInterfaceVersion");
@@ -153,8 +170,66 @@ static int ctx_open(Ctx *c, const char *path) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = c->qfam, .queueCount = 1, .pQueuePriorities = &prio };
+    /* v9.23: enable device extensions/features on demand (fixes RT missing build entry). */
+    PFN_vkEnumerateDeviceExtensionProperties enumDevExt =
+        (PFN_vkEnumerateDeviceExtensionProperties) c_gipa(c, "vkEnumerateDeviceExtensionProperties");
+    static const char *wantExt[] = { "VK_KHR_acceleration_structure", "VK_KHR_ray_query",
+                                     "VK_KHR_deferred_host_operations", "VK_KHR_buffer_device_address",
+                                     "VK_KHR_spirv_1_4", "VK_KHR_shader_float_controls" };
+    static const char *useExt[8];
+    uint32_t useExtN = 0;
+    const uint32_t wantN = (uint32_t) (sizeof(wantExt) / sizeof(wantExt[0]));
+    int hasAS = 0, hasRQ = 0, hasDH = 0, hasBDA = 0;
+    if (enumDevExt) {
+        uint32_t en = 0;
+        if (enumDevExt(c->pd, NULL, &en, NULL) == VK_SUCCESS && en > 0 && en < 4096) {
+            static VkExtensionProperties eps[4096];
+            if (enumDevExt(c->pd, NULL, &en, eps) == VK_SUCCESS) {
+                for (uint32_t i = 0; i < wantN; i++) {
+                    int hit = 0;
+                    for (uint32_t k = 0; k < en; k++)
+                        if (!strcmp(eps[k].extensionName, wantExt[i])) { hit = 1; break; }
+                    if (!hit) continue;
+                    if (!strcmp(wantExt[i], "VK_KHR_acceleration_structure")) hasAS = 1;
+                    if (!strcmp(wantExt[i], "VK_KHR_ray_query")) hasRQ = 1;
+                    if (!strcmp(wantExt[i], "VK_KHR_deferred_host_operations")) hasDH = 1;
+                    if (!strcmp(wantExt[i], "VK_KHR_buffer_device_address")) hasBDA = 1;
+                    if (useExtN < 8) useExt[useExtN++] = wantExt[i];
+                }
+            }
+        }
+    }
+    int api12 = (VK_VERSION_MAJOR(c->props.apiVersion) > 1) ||
+                (VK_VERSION_MAJOR(c->props.apiVersion) == 1 && VK_VERSION_MINOR(c->props.apiVersion) >= 2);
+    int useAS = hasAS && (api12 || (hasBDA && hasDH));
+    int useRQ = hasRQ && useAS;
+    LOG("[6a] dev ext cand: AS=%d RQ=%d DH=%d BDA=%d api12=%d -> enable %u | AS=%d RQ=%d",
+        hasAS, hasRQ, hasDH, hasBDA, api12, useExtN, useAS, useRQ);
+
+    PFN_vkGetPhysicalDeviceFeatures2 getF2 = (PFN_vkGetPhysicalDeviceFeatures2) c_gipa(c, "vkGetPhysicalDeviceFeatures2");
+    if (!getF2) getF2 = (PFN_vkGetPhysicalDeviceFeatures2) c_gipa(c, "vkGetPhysicalDeviceFeatures2KHR");
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR q_as = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+    VkPhysicalDeviceRayQueryFeaturesKHR q_rq = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+    if (getF2 && useAS) {
+        VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &q_as };
+        q_as.pNext = useRQ ? (void *) &q_rq : NULL;
+        getF2(c->pd, &f2);
+    }
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR asf = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+    VkPhysicalDeviceRayQueryFeaturesKHR rqf = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+    void *fNext = NULL;
+    if (useAS && q_as.accelerationStructure) {
+        asf.accelerationStructure = VK_TRUE; asf.pNext = NULL; fNext = &asf;
+        if (useRQ && q_rq.rayQuery) { rqf.rayQuery = VK_TRUE; rqf.pNext = fNext; fNext = &rqf; }
+        LOG("[6b] RT features requested: accelerationStructure=1 rayQuery=%d", (useRQ && q_rq.rayQuery) ? 1 : 0);
+    } else if (useAS) {
+        LOG("[6b] accelerationStructure feature NOT reported -> skip (device create as usual)");
+    }
+
     VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci };
+        .pNext = fNext,
+        .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
+        .enabledExtensionCount = useExtN, .ppEnabledExtensionNames = useExt };
     STEP("vkCreateDevice（建逻辑设备）");
     LOG("[6] 即将调用 vkCreateDevice …\n");
     r = createDev(c->pd, &dci, NULL, &c->dev);
@@ -165,7 +240,9 @@ static int ctx_open(Ctx *c, const char *path) {
     PFN_vkGetDeviceQueue getQ = (PFN_vkGetDeviceQueue) c->gdpa(c->dev, "vkGetDeviceQueue");
     if (!getQ) return 0;
     getQ(c->dev, c->qfam, 0, &c->q);
+    LOG("[loader] %s | device=%s", (path && !strcmp(path, "system")) ? "system-loader" : (path ? path : "(null)"), c->props.deviceName);   /* v9.27: 一眼看清走系统 loader 还是直接 ICD */
     LOG("[7] 设备与队列就绪\n");
+
     return 1;
 }
 static void ctx_close(Ctx *c) {
@@ -197,6 +274,19 @@ typedef struct {
 } Target;
 
 #define MEM_NONE 0xFFFFFFFFu   /* v2.0(B5)：把"没找到"与"类型 0"分开 */
+/* v9.5：**严格**内存类型选取 —— 只接受 flags 完全满足的类型，找不到就 MEM_NONE ✓
+ * 与 pick_mem 的区别：pick_mem 会"退一步"用任何类型（对图像之类可以 ✓），
+ * 但对**主机可见缓冲**绝不能退化 ✗（退化 ⇒ vkMapMemory 失败 ⇒ memcpy(NULL) 崩溃 ✓ 已踩 ✓）*/
+static uint32_t pick_mem_strict(Ctx *c, uint32_t bits, VkMemoryPropertyFlags want) {
+    PFN_vkGetPhysicalDeviceMemoryProperties gm = (PFN_vkGetPhysicalDeviceMemoryProperties)
+        c_gipa(c, "vkGetPhysicalDeviceMemoryProperties");
+    if (!gm) return MEM_NONE;
+    VkPhysicalDeviceMemoryProperties mp; memset(&mp, 0, sizeof(mp));
+    gm(c->pd, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount && i < 32; i++)
+        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
+    return MEM_NONE;
+}
 static uint32_t pick_mem(Ctx *c, uint32_t bits, VkMemoryPropertyFlags want) {
     PFN_vkGetPhysicalDeviceMemoryProperties gm = (PFN_vkGetPhysicalDeviceMemoryProperties)
         c_gipa(c, "vkGetPhysicalDeviceMemoryProperties");
@@ -331,6 +421,7 @@ static jstring finish(JNIEnv *env, const char *path, jstring jso) { (void)path; 
 // ---------------------------------------------------------------- 冒烟
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeIcdSmoke(JNIEnv *env, jobject th, jstring jso) {
+    LOG("原生入口: nativeIcdSmoke 进入\n");
     (void) th; g_len = 0; g_log[0] = 0;
     const char *path = (*env)->GetStringUTFChars(env, jso, NULL);
     LOG("=== ICD 冒烟测试 ===\n驱动: %s\n", path);
@@ -345,6 +436,7 @@ Java_com_dsh_gputest_MainActivity_nativeIcdSmoke(JNIEnv *env, jobject th, jstrin
 // ------------------------------------------------------------ 三角形 + 校验
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeTri(JNIEnv *env, jobject th, jstring jso) {
+    LOG("原生入口: nativeTri 进入\n");
     (void) th; g_len = 0; g_log[0] = 0;
     const char *path = (*env)->GetStringUTFChars(env, jso, NULL);
     LOG("=== 三角形绘制 + 像素校验 ===\n驱动: %s\n", path);
@@ -537,6 +629,1270 @@ static double timer_result_ms(Ctx *c, Timer *tm) {
     return (double) (ts[1] - ts[0]) * tm->period_ms;
 }
 
+
+// ============================================================================
+//  v7.3 · 硬件光追（VK_KHR_ray_query，无 RT pipeline）
+//  为什么能用：系统驱动报告 VK_KHR_acceleration_structure + ray_query ✓
+//  结构：BLAS（三角形网格）→ TLAS（实例）→ compute 里 rayQueryEXT → 存储图像 → 读回
+//  不支持该扩展的驱动 ⇒ 本模块直接拒绝并明确报原因（绝不假装 ✓）
+// ============================================================================
+typedef struct {
+    int shadows;        /* 阴影开关 0/1 */
+    int pcfTaps;        /* PCF 质量：1 / 3 / 5（每轴采样数）*/
+    int shadowRes;      /* 阴影贴图分辨率：1024 / 2048 / 4096 */
+    int cubes;          /* 立方体实例数：16 / 36 / 100 / 400（几何负载阶梯）*/
+    int bloom;          /* 泛光开关 0/1 */
+    int tonemap;        /* 色调映射+伽马 0/1 */
+    int passesPerFrame; /* 每帧重复光照 pass 的次数（负载倍率 1..64）*/
+    int debugView;      /* 0=最终画面 1=阴影贴图 2=法线（正确性自检用）*/
+    int animate;        /* 是否随时间动（关掉便于逐帧比对 ✓）*/
+} LitCfg;
+
+static LitCfg g_lit = { 1, 3, 2048, 36, 1, 1, 1, 0, 1 };
+
+typedef struct {
+    VkAccelerationStructureKHR blas, tlas;
+    VkBuffer blasBuf, tlasBuf, instBuf, vbuf, ibuf, scratch, rbuf;
+    VkDeviceMemory blasMem, tlasMem, instMem, vMem, iMem, scratchMem, rMem;
+    VkImage img; VkDeviceMemory imgMem; VkImageView view;
+    VkDescriptorSetLayout dsl; VkDescriptorPool dpool; VkDescriptorSet dset;
+    VkPipelineLayout pl; VkPipeline pipe; VkCommandPool cpool; VkCommandBuffer cb; VkFence fence;
+    VkQueryPool qp; double period; int tsOk;
+    Ctx ctx; int ok; int w, h; uint32_t ntri;
+} RtState;
+static RtState g_rtx;
+
+static VkDeviceAddress buf_addr(Ctx *c, VkBuffer b) {
+    PFN_vkGetBufferDeviceAddress f = (PFN_vkGetBufferDeviceAddress) c_gipa(c, "vkGetBufferDeviceAddress");
+    if (!f) f = (PFN_vkGetBufferDeviceAddress) c_gipa(c, "vkGetBufferDeviceAddressKHR");
+    VkBufferDeviceAddressInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b };
+    return f ? f(c->dev, &bi) : 0;
+}
+/* 简易缓冲分配（device-local + host-visible 各一，便于我们直接读写）*/
+static int mk_buf(Ctx *c, VkDeviceSize sz, VkBufferUsageFlags use, VkBuffer *out, VkDeviceMemory *mem, int host) {
+    PFN_vkCreateBuffer cb_ = (PFN_vkCreateBuffer) c->gdpa(c->dev, "vkCreateBuffer");
+    PFN_vkGetBufferMemoryRequirements gm = (PFN_vkGetBufferMemoryRequirements) c->gdpa(c->dev, "vkGetBufferMemoryRequirements");
+    PFN_vkAllocateMemory am = (PFN_vkAllocateMemory) c->gdpa(c->dev, "vkAllocateMemory");
+    PFN_vkBindBufferMemory bm = (PFN_vkBindBufferMemory) c->gdpa(c->dev, "vkBindBufferMemory");
+    if (!cb_ || !gm || !am || !bm) return 0;
+    VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sz,
+                              .usage = use | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT };
+    if (cb_(c->dev, &bc, NULL, out) != VK_SUCCESS) return 0;
+    VkMemoryRequirements mr; gm(c->dev, *out, &mr);
+    uint32_t mt;
+    if (host) {
+        /* 两级降级：先要 HOST_VISIBLE|HOST_COHERENT，退一步只要 HOST_VISIBLE ✓；
+         * 都拿不到就**明确失败** ✗（绝不给主机缓冲返回不可见类型，否则映射必失败 ✓）*/
+        mt = pick_mem_strict(c, mr.memoryTypeBits,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (mt == MEM_NONE) mt = pick_mem_strict(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+        if (mt == MEM_NONE) {
+            LOG("  ! mk_buf(host): 该设备没有 HOST_VISIBLE 内存类型匹配 0x%x ⇒ 拒绝（不退化 ✓）\n", mr.memoryTypeBits);
+            return 0;
+        }
+    } else {
+        mt = pick_mem(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (mt == MEM_NONE) return 0;
+    }
+    VkMemoryAllocateFlagsInfo fi = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+                                     .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT };
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                .pNext = &fi, .allocationSize = mr.size, .memoryTypeIndex = mt };
+    if (am(c->dev, &ai, NULL, mem) != VK_SUCCESS) return 0;
+    return bm(c->dev, *out, *mem, 0) == VK_SUCCESS;
+}
+
+/* 场景网格：UV 球（约 480 三角形）+ 一块地面 */
+static int rt_make_mesh(Ctx *c, float **vout, uint32_t **iout, uint32_t *ntri) {
+    const int SEG = 24, RING = 12;
+    int nv = (RING + 1) * (SEG + 1) + 4;
+    float *v = (float *) malloc(sizeof(float) * nv * 3);
+    uint32_t *idx = (uint32_t *) malloc(sizeof(uint32_t) * (SEG * RING * 6 + 6));
+    int vi = 0;
+    for (int r = 0; r <= RING; r++) {
+        float phi = (float) r / RING * 3.14159265f;
+        for (int sg = 0; sg <= SEG; sg++) {
+            float th = (float) sg / SEG * 6.2831853f;
+            v[vi*3+0] = 0.9f * sinf(phi) * cosf(th);
+            v[vi*3+1] = 0.9f * cosf(phi) + 0.9f;
+            v[vi*3+2] = 0.9f * sinf(phi) * sinf(th);
+            vi++;
+        }
+    }
+    int base = vi;   /* 地面 4 顶点 */
+    float gp[4][3] = { { -3,0,-3 }, { 3,0,-3 }, { 3,0,3 }, { -3,0,3 } };
+    for (int i = 0; i < 4; i++) { v[vi*3+0]=gp[i][0]; v[vi*3+1]=gp[i][1]; v[vi*3+2]=gp[i][2]; vi++; }
+    uint32_t *ii = idx; int ni = 0;
+    for (int r = 0; r < RING; r++) for (int sg = 0; sg < SEG; sg++) {
+        uint32_t a = r*(SEG+1)+sg, b = a+1, cc = a+(SEG+1), d = cc+1;
+        ii[ni++]=a; ii[ni++]=cc; ii[ni++]=b;  ii[ni++]=b; ii[ni++]=cc; ii[ni++]=d;
+    }
+    ii[ni++]=base; ii[ni++]=base+1; ii[ni++]=base+2; ii[ni++]=base; ii[ni++]=base+2; ii[ni++]=base+3;
+    *vout = v; *iout = idx; *ntri = (uint32_t)(ni / 3);
+    return 1;
+}
+
+
+/* 光追推常量（与 rt.comp 的 push_constant 块逐字段对齐 ✓ 112 字节）*/
+typedef struct { float invVP[16]; float camPos[4]; float lightDir[4]; int shadowOn; int bounces; float t; int _pad; } RtPC;
+
+/* 直接构造「NDC→世界」矩阵（= 视投影的逆），避免写通用 4x4 求逆 ✓ */
+static void rt_inv_vp(float *m, float aspect, const float *eye, const float *fwd,
+                      const float *right, const float *up, float fovy) {
+    float th = tanf(fovy * 0.5f), tw = th * aspect;
+    for (int i = 0; i < 16; i++) m[i] = 0.0f;
+    for (int k = 0; k < 3; k++) {
+        m[0 + k]  = right[k] * tw;                 /* 列 0 */
+        m[4 + k]  = up[k] * th;                    /* 列 1 */
+        m[8 + k]  = -fwd[k];                       /* 列 2 */
+        m[12 + k] = eye[k];                        /* 列 3 */
+    }
+    m[11] = -1.0f;                                  /* 透视除法的 w = -z_view ✓ */
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeRtInit(JNIEnv *env, jobject th, jstring jso, jint w, jint h) {
+    LOG("光影入口: nativeRtInit 进入\n");
+    (void) th;
+    const char *path = jso ? (*env)->GetStringUTFChars(env, jso, NULL) : NULL;
+    char out[320];
+    if (g_rtx.ok) { ctx_close(&g_rtx.ctx); memset(&g_rtx, 0, sizeof(g_rtx)); }
+    if (!ctx_open(&g_rtx.ctx, path ? path : "system")) {
+        if (path) (*env)->ReleaseStringUTFChars(env, jso, path);
+        return (*env)->NewStringUTF(env, "光追：驱动不可用");
+    }
+    if (path) (*env)->ReleaseStringUTFChars(env, jso, path);
+    Ctx *c = &g_rtx.ctx;
+    g_rtx.w = (int) w; g_rtx.h = (int) h;
+
+    /* 入口（全部自己取 ✓ 因为我们用 VK_NO_PROTOTYPES ✓）*/
+    PFN_vkGetBufferDeviceAddressKHR gaddr =
+        (PFN_vkGetBufferDeviceAddressKHR) c_gipa(c, "vkGetBufferDeviceAddressKHR");
+    if (!gaddr) gaddr = (PFN_vkGetBufferDeviceAddressKHR) c_gipa(c, "vkGetBufferDeviceAddress");
+    PFN_vkGetAccelerationStructureBuildSizesKHR gsz =
+        (PFN_vkGetAccelerationStructureBuildSizesKHR) c_gipa(c, "vkGetAccelerationStructureBuildSizesKHR");
+    PFN_vkCreateAccelerationStructureKHR cas =
+        (PFN_vkCreateAccelerationStructureKHR) c_gipa(c, "vkCreateAccelerationStructureKHR");
+    PFN_vkGetAccelerationStructureDeviceAddressKHR asaddr =
+        (PFN_vkGetAccelerationStructureDeviceAddressKHR) c_gipa(c, "vkGetAccelerationStructureDeviceAddressKHR");
+    if (!gaddr || !gsz || !cas || !asaddr) {
+        ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx));
+        return (*env)->NewStringUTF(env, "光追：该驱动缺少加速结构入口 ⇒ 不支持硬件光追 ✗（不假装 ✓）");
+    }
+    /* 网格 → 顶点/索引缓冲 */
+    float *verts = NULL; uint32_t *idx = NULL; uint32_t ntri = 0;
+    if (!rt_make_mesh(c, &verts, &idx, &ntri)) { ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx)); return (*env)->NewStringUTF(env, "网格生成失败"); }
+    int nv = 0; { /* 顶点数 = 球(RING+1)*(SEG+1) + 地面 4 */ nv = 13 * 25 + 4; }
+    VkDeviceSize vsz = (VkDeviceSize) nv * 12, isz = (VkDeviceSize) ntri * 3 * 4;
+    if (!mk_buf(c, vsz, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, &g_rtx.vbuf, &g_rtx.vMem, 1) ||
+        !mk_buf(c, isz, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, &g_rtx.ibuf, &g_rtx.iMem, 1)) {
+        free(verts); free(idx); ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx)); return (*env)->NewStringUTF(env, "顶点/索引缓冲失败"); }
+    PFN_vkMapMemory mp = (PFN_vkMapMemory) c->gdpa(c->dev, "vkMapMemory");
+    void *p = NULL;
+    mp(c->dev, g_rtx.vMem, 0, VK_WHOLE_SIZE, 0, &p); memcpy(p, verts, vsz); 
+    PFN_vkUnmapMemory um = (PFN_vkUnmapMemory) c->gdpa(c->dev, "vkUnmapMemory"); um(c->dev, g_rtx.vMem);
+    mp(c->dev, g_rtx.iMem, 0, VK_WHOLE_SIZE, 0, &p); memcpy(p, idx, isz); um(c->dev, g_rtx.iMem);
+    free(verts); free(idx);
+
+    VkDeviceAddress vaddr = nv ? buf_addr(c, g_rtx.vbuf) : 0;
+    VkDeviceAddress iaddr = buf_addr(c, g_rtx.ibuf);
+
+    /* ---- BLAS ---- */
+    VkAccelerationStructureGeometryKHR geo; memset(&geo, 0, sizeof(geo));
+    geo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geo.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+    geo.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+    geo.geometry.triangles.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+    geo.geometry.triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+    geo.geometry.triangles.vertexData.deviceAddress = vaddr;
+    geo.geometry.triangles.vertexStride = 12;
+    geo.geometry.triangles.maxVertex = (uint32_t)(nv - 1);
+    geo.geometry.triangles.indexType = VK_INDEX_TYPE_UINT32;
+    geo.geometry.triangles.indexData.deviceAddress = iaddr;
+    VkAccelerationStructureBuildGeometryInfoKHR bi; memset(&bi, 0, sizeof(bi));
+    bi.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    bi.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    bi.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    bi.geometryCount = 1; bi.pGeometries = &geo;
+    uint32_t prim = ntri;
+    VkAccelerationStructureBuildSizesInfoKHR szi; memset(&szi, 0, sizeof(szi));
+    szi.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    gsz(c->dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &prim, &szi);
+    if (!mk_buf(c, szi.accelerationStructureSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, &g_rtx.blasBuf, &g_rtx.blasMem, 0)) {
+        ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx)); return (*env)->NewStringUTF(env, "BLAS 缓冲失败（可能显存不足）"); }
+    VkAccelerationStructureCreateInfoKHR aci; memset(&aci, 0, sizeof(aci));
+    aci.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+    aci.buffer = g_rtx.blasBuf; aci.size = szi.accelerationStructureSize;
+    aci.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+    if (cas(c->dev, &aci, NULL, &g_rtx.blas) != VK_SUCCESS) { ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx)); return (*env)->NewStringUTF(env, "BLAS 创建失败"); }
+    if (!mk_buf(c, szi.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g_rtx.scratch, &g_rtx.scratchMem, 0)) {
+        ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx)); return (*env)->NewStringUTF(env, "scratch 缓冲失败"); }
+    bi.dstAccelerationStructure = g_rtx.blas;
+    bi.scratchData.deviceAddress = buf_addr(c, g_rtx.scratch);
+    VkAccelerationStructureBuildRangeInfoKHR ri = { .primitiveCount = prim, .primitiveOffset = 0, .firstVertex = 0, .transformOffset = 0 };
+    const VkAccelerationStructureBuildRangeInfoKHR *pri = &ri;
+    /* 用一次性命令缓冲提交构建 ✓ */
+    PFN_vkCreateCommandPool ccp = (PFN_vkCreateCommandPool) c->gdpa(c->dev, "vkCreateCommandPool");
+    PFN_vkAllocateCommandBuffers acb = (PFN_vkAllocateCommandBuffers) c->gdpa(c->dev, "vkAllocateCommandBuffers");
+    PFN_vkBeginCommandBuffer bcb = (PFN_vkBeginCommandBuffer) c->gdpa(c->dev, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer ecb = (PFN_vkEndCommandBuffer) c->gdpa(c->dev, "vkEndCommandBuffer");
+    PFN_vkCmdBuildAccelerationStructuresKHR build =
+        (PFN_vkCmdBuildAccelerationStructuresKHR) c->gdpa(c->dev, "vkCmdBuildAccelerationStructuresKHR");
+    PFN_vkQueueSubmit qs = (PFN_vkQueueSubmit) c->gdpa(c->dev, "vkQueueSubmit");
+    PFN_vkCreateFence cf = (PFN_vkCreateFence) c->gdpa(c->dev, "vkCreateFence");
+    PFN_vkWaitForFences wf = (PFN_vkWaitForFences) c->gdpa(c->dev, "vkWaitForFences");
+    if (ccp && acb && bcb && ecb && build && qs && cf && wf) {
+        VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,   /* v9.9：每帧反复 begin 同一 CB 必须可重置（原先缺 ⇒ VUID 违规 ⇒ 录制不生效 ⇒ 画面不动）✓ */
+        .queueFamilyIndex = c->qfam };
+        ccp(c->dev, &cpci, NULL, &g_rtx.cpool);
+        VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            .commandPool = g_rtx.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        acb(c->dev, &cbai, &g_rtx.cb);
+        VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        bcb(g_rtx.cb, &cbbi);
+        build(g_rtx.cb, 1, &bi, &pri);
+        ecb(g_rtx.cb);
+        VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        cf(c->dev, &fci, NULL, &g_rtx.fence);
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_rtx.cb };
+        if (qs(c->q, 1, &si, g_rtx.fence) != VK_SUCCESS || wf(c->dev, 1, &g_rtx.fence, VK_TRUE, 1000000000ULL) != VK_SUCCESS) {
+            ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx)); return (*env)->NewStringUTF(env, "BLAS 构建提交失败 ⇒ 驱动/GPU 侧问题"); }
+    } else {
+        ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx)); return (*env)->NewStringUTF(env, "缺少构建命令入口");
+    }
+    g_rtx.ntri = ntri;
+    g_rtx.ok = 1;
+    snprintf(out, sizeof(out), "光追就绪 ✓ BLAS 已建（%u 三角形 = 球 %d×%d + 地面）%dx%d",
+             ntri, 12, 24, (int) w, (int) h);
+    return (*env)->NewStringUTF(env, out);
+}
+
+
+/* ---- 光追：TLAS + 存储图像 + 描述符 + compute 管线 + dispatch ---- */
+static int rt_mk_image(Ctx *c, int w, int h) {
+    PFN_vkCreateImage ci = (PFN_vkCreateImage) c->gdpa(c->dev, "vkCreateImage");
+    PFN_vkGetImageMemoryRequirements gm = (PFN_vkGetImageMemoryRequirements) c->gdpa(c->dev, "vkGetImageMemoryRequirements");
+    PFN_vkAllocateMemory am = (PFN_vkAllocateMemory) c->gdpa(c->dev, "vkAllocateMemory");
+    PFN_vkBindImageMemory bm = (PFN_vkBindImageMemory) c->gdpa(c->dev, "vkBindImageMemory");
+    PFN_vkCreateImageView cv = (PFN_vkCreateImageView) c->gdpa(c->dev, "vkCreateImageView");
+    if (!ci || !gm || !am || !bm || !cv) return 0;
+    VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { (uint32_t) w, (uint32_t) h, 1 },
+        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (ci(c->dev, &ic, NULL, &g_rtx.img) != VK_SUCCESS) return 0;
+    VkMemoryRequirements mr; gm(c->dev, g_rtx.img, &mr);
+    uint32_t mt = pick_mem(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt == MEM_NONE) return 0;
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mt };
+    if (am(c->dev, &ai, NULL, &g_rtx.imgMem) != VK_SUCCESS) return 0;
+    if (bm(c->dev, g_rtx.img, g_rtx.imgMem, 0) != VK_SUCCESS) return 0;
+    VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_rtx.img,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    return cv(c->dev, &vc, NULL, &g_rtx.view) == VK_SUCCESS;
+}
+
+static int rt_build_tlas(Ctx *c) {
+    PFN_vkGetAccelerationStructureDeviceAddressKHR asaddr =
+        (PFN_vkGetAccelerationStructureDeviceAddressKHR) c_gipa(c, "vkGetAccelerationStructureDeviceAddressKHR");
+    PFN_vkGetAccelerationStructureBuildSizesKHR gsz =
+        (PFN_vkGetAccelerationStructureBuildSizesKHR) c_gipa(c, "vkGetAccelerationStructureBuildSizesKHR");
+    PFN_vkCreateAccelerationStructureKHR cas =
+        (PFN_vkCreateAccelerationStructureKHR) c_gipa(c, "vkCreateAccelerationStructureKHR");
+    PFN_vkCmdBuildAccelerationStructuresKHR build =
+        (PFN_vkCmdBuildAccelerationStructuresKHR) c->gdpa(c->dev, "vkCmdBuildAccelerationStructuresKHR");
+    if (!asaddr || !gsz || !cas || !build) return 0;
+    if (!mk_buf(c, 64, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, &g_rtx.instBuf, &g_rtx.instMem, 1)) return 0;
+    PFN_vkMapMemory mp = (PFN_vkMapMemory) c->gdpa(c->dev, "vkMapMemory");
+    PFN_vkUnmapMemory um = (PFN_vkUnmapMemory) c->gdpa(c->dev, "vkUnmapMemory");
+    void *p = NULL; mp(c->dev, g_rtx.instMem, 0, VK_WHOLE_SIZE, 0, &p);
+    VkAccelerationStructureDeviceAddressInfoKHR dai = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR, .accelerationStructure = g_rtx.blas };
+    VkDeviceAddress ba = asaddr(c->dev, &dai);
+    /* 手填 VkAccelerationStructureInstanceKHR（避免对其打包布局的依赖 ✓ 64 字节 ✓）*/
+    memset(p, 0, 64);
+    float *f = (float *) p;
+    f[0] = 1; f[5] = 1; f[10] = 1;                       /* 3x4 变换 = 单位矩阵 */
+    uint32_t *u = (uint32_t *) p;
+    u[16 / 4 + 0] = 0xFF000000u;                          /* instanceCustomIndex:24 | mask:8 ⇒ mask=0xFF ✓ */
+    u[16 / 4 + 1] = 0;                                    /* instanceShaderBindingTableRecordOffset:24 | flags:8 */
+    u[16 / 4 + 2] = (uint32_t) (ba & 0xFFFFFFFFu);        /* accelerationStructureReference 低 32 位 */
+    u[16 / 4 + 3] = (uint32_t) (ba >> 32);                /* 高 32 位 */
+    um(c->dev, g_rtx.instMem);
+    VkAccelerationStructureGeometryKHR g; memset(&g, 0, sizeof(g));
+    g.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    g.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    g.geometry.instances.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    g.geometry.instances.arrayOfPointers = VK_FALSE;
+    g.geometry.instances.data.deviceAddress = buf_addr(c, g_rtx.instBuf);
+    VkAccelerationStructureBuildGeometryInfoKHR bi; memset(&bi, 0, sizeof(bi));
+    bi.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    bi.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    bi.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    bi.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    bi.geometryCount = 1; bi.pGeometries = &g;
+    uint32_t prim = 1;
+    VkAccelerationStructureBuildSizesInfoKHR szi; memset(&szi, 0, sizeof(szi));
+    szi.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    gsz(c->dev, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &bi, &prim, &szi);
+    if (!mk_buf(c, szi.accelerationStructureSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, &g_rtx.tlasBuf, &g_rtx.tlasMem, 0)) return 0;
+    VkAccelerationStructureCreateInfoKHR aci; memset(&aci, 0, sizeof(aci));
+    aci.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+    aci.buffer = g_rtx.tlasBuf; aci.size = szi.accelerationStructureSize;
+    aci.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    if (cas(c->dev, &aci, NULL, &g_rtx.tlas) != VK_SUCCESS) return 0;
+    VkBuffer sc; VkDeviceMemory scm;
+    if (!mk_buf(c, szi.buildScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &sc, &scm, 0)) return 0;
+    bi.dstAccelerationStructure = g_rtx.tlas;
+    bi.scratchData.deviceAddress = buf_addr(c, sc);
+    VkAccelerationStructureBuildRangeInfoKHR ri = { .primitiveCount = 1 };
+    const VkAccelerationStructureBuildRangeInfoKHR *pri = &ri;
+    PFN_vkResetFences rf = (PFN_vkResetFences) c->gdpa(c->dev, "vkResetFences");
+    PFN_vkBeginCommandBuffer bcb = (PFN_vkBeginCommandBuffer) c->gdpa(c->dev, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer ecb = (PFN_vkEndCommandBuffer) c->gdpa(c->dev, "vkEndCommandBuffer");
+    PFN_vkQueueSubmit qs = (PFN_vkQueueSubmit) c->gdpa(c->dev, "vkQueueSubmit");
+    PFN_vkWaitForFences wf = (PFN_vkWaitForFences) c->gdpa(c->dev, "vkWaitForFences");
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    bcb(g_rtx.cb, &cbbi); build(g_rtx.cb, 1, &bi, &pri); ecb(g_rtx.cb);
+    rf(c->dev, 1, &g_rtx.fence); 
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_rtx.cb };
+    return qs(c->q, 1, &si, g_rtx.fence) == VK_SUCCESS && wf(c->dev, 1, &g_rtx.fence, VK_TRUE, 1000000000ULL) == VK_SUCCESS;
+}
+
+/* 计算管线 + 描述符（binding0=TLAS binding1=存储图像 ✓）*/
+static int rt_mk_pipeline(Ctx *c) {
+    PFN_vkCreateShaderModule mksh = (PFN_vkCreateShaderModule) c->gdpa(c->dev, "vkCreateShaderModule");
+    PFN_vkCreateDescriptorSetLayout mkdl = (PFN_vkCreateDescriptorSetLayout) c->gdpa(c->dev, "vkCreateDescriptorSetLayout");
+    PFN_vkCreateDescriptorPool mkdp = (PFN_vkCreateDescriptorPool) c->gdpa(c->dev, "vkCreateDescriptorPool");
+    PFN_vkAllocateDescriptorSets ads = (PFN_vkAllocateDescriptorSets) c->gdpa(c->dev, "vkAllocateDescriptorSets");
+    PFN_vkUpdateDescriptorSets uds = (PFN_vkUpdateDescriptorSets) c->gdpa(c->dev, "vkUpdateDescriptorSets");
+    PFN_vkCreatePipelineLayout mkpl = (PFN_vkCreatePipelineLayout) c->gdpa(c->dev, "vkCreatePipelineLayout");
+    PFN_vkCreateComputePipelines mkcp = (PFN_vkCreateComputePipelines) c->gdpa(c->dev, "vkCreateComputePipelines");
+    if (!mksh || !mkdl || !mkdp || !ads || !uds || !mkpl || !mkcp) return 0;
+    VkDescriptorSetLayoutBinding b[2];
+    memset(b, 0, sizeof(b));
+    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo dl = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b };
+    if (mkdl(c->dev, &dl, NULL, &g_rtx.dsl) != VK_SUCCESS) return 0;
+    VkDescriptorPoolSize ps[2] = {
+        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 } };
+    VkDescriptorPoolCreateInfo dp = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = ps };
+    if (mkdp(c->dev, &dp, NULL, &g_rtx.dpool) != VK_SUCCESS) return 0;
+    VkDescriptorSetAllocateInfo da = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_rtx.dpool, .descriptorSetCount = 1, .pSetLayouts = &g_rtx.dsl };
+    if (ads(c->dev, &da, &g_rtx.dset) != VK_SUCCESS) return 0;
+    VkWriteDescriptorSetAccelerationStructureKHR wa; memset(&wa, 0, sizeof(wa));
+    wa.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+    wa.accelerationStructureCount = 1; wa.pAccelerationStructures = &g_rtx.tlas;
+    VkDescriptorImageInfo ii = { .imageView = g_rtx.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    VkWriteDescriptorSet w[2]; memset(w, 0, sizeof(w));
+    w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].pNext = &wa;
+    w[0].dstSet = g_rtx.dset; w[0].dstBinding = 0; w[0].descriptorCount = 1;
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[1].dstSet = g_rtx.dset; w[1].dstBinding = 1; w[1].descriptorCount = 1;
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &ii;
+    uds(c->dev, 2, w, 0, NULL);
+    VkShaderModuleCreateInfo sm = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = rt_comp_spv_len * 4, .pCode = rt_comp_spv };
+    VkShaderModule mod = NULL;
+    if (mksh(c->dev, &sm, NULL, &mod) != VK_SUCCESS) return 0;
+    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = sizeof(RtPC) };
+    VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &g_rtx.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+    if (mkpl(c->dev, &plci, NULL, &g_rtx.pl) != VK_SUCCESS) return 0;
+    VkComputePipelineCreateInfo cp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = mod, .pName = "main" },
+        .layout = g_rtx.pl };
+    if (mkcp(c->dev, VK_NULL_HANDLE, 1, &cp, NULL, &g_rtx.pipe) != VK_SUCCESS) return 0;
+    /* 读回缓冲（主机可见 ✓）*/
+    return mk_buf(c, (VkDeviceSize) g_rtx.w * g_rtx.h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g_rtx.rbuf, &g_rtx.rMem, 1);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeRtFrame(JNIEnv *env, jobject th) {
+    LOG("光影入口: nativeRtFrame 进入\n");
+    (void) th;
+    char out[320];
+    if (!g_rtx.ok) return (*env)->NewStringUTF(env, "光追未初始化");
+    Ctx *c = &g_rtx.ctx;
+    if (!g_rtx.tlas) {
+        if (!rt_build_tlas(c)) return (*env)->NewStringUTF(env, "X TLAS 构建失败 ⇒ 驱动/GPU 侧问题");
+        if (!rt_mk_image(c, g_rtx.w, g_rtx.h)) return (*env)->NewStringUTF(env, "X 存储图像创建失败");
+        if (!rt_mk_pipeline(c)) return (*env)->NewStringUTF(env, "X 光追管线创建失败");
+        LOG("光追：TLAS + 存储图像 + 管线就绪\n");
+    }
+    PFN_vkResetFences rf = (PFN_vkResetFences) c->gdpa(c->dev, "vkResetFences");
+    PFN_vkBeginCommandBuffer bcb = (PFN_vkBeginCommandBuffer) c->gdpa(c->dev, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer ecb = (PFN_vkEndCommandBuffer) c->gdpa(c->dev, "vkEndCommandBuffer");
+    PFN_vkCmdBindPipeline bp = (PFN_vkCmdBindPipeline) c->gdpa(c->dev, "vkCmdBindPipeline");
+    PFN_vkCmdBindDescriptorSets bds = (PFN_vkCmdBindDescriptorSets) c->gdpa(c->dev, "vkCmdBindDescriptorSets");
+    PFN_vkCmdPushConstants pc_ = (PFN_vkCmdPushConstants) c->gdpa(c->dev, "vkCmdPushConstants");
+    PFN_vkCmdDispatch disp = (PFN_vkCmdDispatch) c->gdpa(c->dev, "vkCmdDispatch");
+    PFN_vkCmdPipelineBarrier bar = (PFN_vkCmdPipelineBarrier) c->gdpa(c->dev, "vkCmdPipelineBarrier");
+    PFN_vkCmdCopyImageToBuffer c2b = (PFN_vkCmdCopyImageToBuffer) c->gdpa(c->dev, "vkCmdCopyImageToBuffer");
+    PFN_vkQueueSubmit qs = (PFN_vkQueueSubmit) c->gdpa(c->dev, "vkQueueSubmit");
+    PFN_vkWaitForFences wf = (PFN_vkWaitForFences) c->gdpa(c->dev, "vkWaitForFences");
+    if (!rf || !bcb || !ecb || !bp || !bds || !pc_ || !disp || !bar || !c2b || !qs || !wf)
+        return (*env)->NewStringUTF(env, "X 光追命令入口缺失");
+    RtPC k; memset(&k, 0, sizeof(k));
+    float eye[3] = { 3.2f, 2.4f, 3.2f };
+    float fwd[3] = { -0.62f, -0.42f, -0.62f }, right[3] = { 0.707f, 0.0f, -0.707f }, up[3] = { 0, 1, 0 };
+    rt_inv_vp(k.invVP, (float) g_rtx.w / (float) g_rtx.h, eye, fwd, right, up, 1.0f);
+    memcpy(k.camPos, eye, 12); k.camPos[3] = 1.0f;
+    k.lightDir[0] = 0.5f; k.lightDir[1] = 1.0f; k.lightDir[2] = 0.3f; k.lightDir[3] = 0.0f;
+    k.shadowOn = g_lit.shadows; k.bounces = g_lit.passesPerFrame; k.t = (float) (now_ms() / 1000.0);
+    VkCommandBufferBeginInfo bi2 = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    double t0 = now_ms();
+    if (bcb(g_rtx.cb, &bi2) != VK_SUCCESS) return (*env)->NewStringUTF(env, "X begin 失败");
+    bp(g_rtx.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_rtx.pipe);
+    bds(g_rtx.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_rtx.pl, 0, 1, &g_rtx.dset, 0, NULL);
+    pc_(g_rtx.cb, g_rtx.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(k), &k);
+    disp(g_rtx.cb, (uint32_t) ((g_rtx.w + 7) / 8), (uint32_t) ((g_rtx.h + 7) / 8), 1);
+    VkImageMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .image = g_rtx.img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    bar(g_rtx.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    VkBufferImageCopy bc = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { (uint32_t) g_rtx.w, (uint32_t) g_rtx.h, 1 } };
+    c2b(g_rtx.cb, g_rtx.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_rtx.rbuf, 1, &bc);
+    ecb(g_rtx.cb);
+    rf(c->dev, 1, &g_rtx.fence);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_rtx.cb };
+    VkResult r = qs(c->q, 1, &si, g_rtx.fence);
+    if (r == VK_SUCCESS) r = wf(c->dev, 1, &g_rtx.fence, VK_TRUE, 3000000000ULL);
+    double t1 = now_ms();
+    if (r != VK_SUCCESS)
+        snprintf(out, sizeof(out), "X 光追提交失败 r=%d（%s）三角形=%u —— 这一帧保留", r,
+                 r == -4 ? "VK_ERROR_DEVICE_LOST" : "见 VkResult 表", g_rtx.ntri);
+    else
+        snprintf(out, sizeof(out), "光追光栅化完成 ✓ BLAS=%u 三角形 · 每像素 %d 次追踪 · 墙钟 %.2f ms · %.1f FPS",
+                 g_rtx.ntri, k.bounces, t1 - t0, (t1 - t0) > 0 ? 1000.0 / (t1 - t0) : 0.0);
+    return (*env)->NewStringUTF(env, out);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeRtBlit(JNIEnv *env, jobject th, jobject bmp) {
+    LOG("光影入口: nativeRtBlit 进入\n");
+    (void) th;
+    if (!g_rtx.ok || !g_rtx.rbuf) return (*env)->NewStringUTF(env, "光追无图像");
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bmp, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return (*env)->NewStringUTF(env, "取位图信息失败");
+    void *pix = NULL;
+    if (AndroidBitmap_lockPixels(env, bmp, &pix) != ANDROID_BITMAP_RESULT_SUCCESS) return (*env)->NewStringUTF(env, "锁定位图失败");
+    PFN_vkMapMemory mp = (PFN_vkMapMemory) g_rtx.ctx.gdpa(g_rtx.ctx.dev, "vkMapMemory");
+    PFN_vkUnmapMemory um = (PFN_vkUnmapMemory) g_rtx.ctx.gdpa(g_rtx.ctx.dev, "vkUnmapMemory");
+    void *src = NULL;
+    if (mp && mp(g_rtx.ctx.dev, g_rtx.rMem, 0, VK_WHOLE_SIZE, 0, &src) == VK_SUCCESS && src) {
+        int cw = g_rtx.w < (int) info.width ? g_rtx.w : (int) info.width;
+        int ch = g_rtx.h < (int) info.height ? g_rtx.h : (int) info.height;
+        for (int y = 0; y < ch; y++) {
+            uint8_t *dst = (uint8_t *) pix + (size_t) y * info.stride;
+            memcpy(dst, (const uint8_t *) src + (size_t) y * g_rtx.w * 4, (size_t) cw * 4);
+        }
+        um(g_rtx.ctx.dev, g_rtx.rMem);
+    }
+    AndroidBitmap_unlockPixels(env, bmp);
+    return (*env)->NewStringUTF(env, "已拷入位图");
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeRtStop(JNIEnv *env, jobject th) {
+    (void) th;
+    if (g_rtx.ok) { ctx_close(&g_rtx.ctx); memset(&g_rtx, 0, sizeof(g_rtx)); }
+    return (*env)->NewStringUTF(env, "光追已释放");
+}
+
+
+// ============================================================================
+//  v7.6 · 光影多 pass 链（地基：阴影贴图 / 颜色目标 / albedo 纹理 / 三条 render pass）
+//  链路：① 深度 pass（光空间）→ ② 光照 pass（采样阴影 + PCF + Blinn-Phong）→ ③ 后处理（泛光+暗角）
+//  用的是已编进 .so 的四段着色器（shaders_lit.h ✓）
+// ============================================================================
+typedef struct {
+    Ctx ctx; int ok, w, h;
+    VkImage shadow; VkDeviceMemory shadowMem; VkImageView shadowView; VkSampler shadowSampler;
+    VkImage color;  VkDeviceMemory colorMem;  VkImageView colorView;  VkSampler colorSampler;
+    VkImage albedo; VkDeviceMemory albedoMem; VkImageView albedoView;
+    VkImage post; VkDeviceMemory postMem; VkImageView postView;      /* 后处理画布（第二张，避免读写同图 ✓）*/
+    VkDescriptorSet descPost;
+    VkRenderPass rpDepth, rpScene, rpPost;
+    VkFramebuffer fbShadow, fbScene, fbPost;
+    VkDescriptorSetLayout dsl; VkDescriptorPool dpool; VkDescriptorSet dset;
+    VkPipelineLayout plScene, plPost;
+    VkPipeline pipeDepth, pipeScene, pipePost;
+    VkCommandPool cpool; VkCommandBuffer cb; VkFence fence;
+    VkBuffer rbuf; VkDeviceMemory rMem;
+    VkQueryPool qp; double period; int tsOk;
+    int shadowRes, nInst;
+} LitState;
+static LitState g_litx;
+
+typedef struct { float mvp[16]; float lightVP[16]; int nInst; float t; int pcf; int shadows; int shadowRes; int _pad; } LitPC;  /* 144 ✓ 与 lit.frag v2 对齐 */
+typedef struct { int bloom; int tonemap; int debugView; float texel; } LitPC2;   /* 16 ✓ 与 post.frag v2 对齐 */
+
+static VkImage mk_img(Ctx *c, int w, int h, VkFormat fmt, VkImageUsageFlags use, VkImage *img, VkDeviceMemory *mem) {
+    if (!c || !c->dev) { LOG("  ! mk_img: 上下文/设备为空 ⇒ 拒绝执行\n"); return NULL; }
+    if (!img || !mem) { LOG("  ! mk_img: 输出指针为空\n"); return NULL; }
+    LOG("  · mk_img %dx%d fmt=%d\n", w, h, (int) fmt);
+    PFN_vkCreateImage ci = (PFN_vkCreateImage) c->gdpa(c->dev, "vkCreateImage");
+    PFN_vkGetImageMemoryRequirements gm = (PFN_vkGetImageMemoryRequirements) c->gdpa(c->dev, "vkGetImageMemoryRequirements");
+    PFN_vkAllocateMemory am = (PFN_vkAllocateMemory) c->gdpa(c->dev, "vkAllocateMemory");
+    PFN_vkBindImageMemory bm = (PFN_vkBindImageMemory) c->gdpa(c->dev, "vkBindImageMemory");
+    if (!ci || !gm || !am || !bm) return NULL;
+    VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = fmt, .extent = { (uint32_t) w, (uint32_t) h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = use,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (ci(c->dev, &ic, NULL, img) != VK_SUCCESS) return NULL;
+    VkMemoryRequirements mr; gm(c->dev, *img, &mr);
+    uint32_t mt = pick_mem(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt == MEM_NONE) return NULL;
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mt };
+    return (am(c->dev, &ai, NULL, mem) == VK_SUCCESS && bm(c->dev, *img, *mem, 0) == VK_SUCCESS) ? *img : NULL;
+}
+static VkImageView mk_view(Ctx *c, VkImage img, VkFormat fmt, VkImageAspectFlags asp) {
+    if (!c || !c->dev) { LOG("  ! mk_view: 设备为空\n"); return NULL; }
+    PFN_vkCreateImageView cv = (PFN_vkCreateImageView) c->gdpa(c->dev, "vkCreateImageView");
+    VkImageView v = NULL;
+    VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt, .subresourceRange = { asp, 0, 1, 0, 1 } };
+    return (cv && cv(c->dev, &vc, NULL, &v) == VK_SUCCESS) ? v : NULL;
+}
+static int mk_rp_depth(Ctx *c, VkRenderPass *rp) {
+    PFN_vkCreateRenderPass mk = (PFN_vkCreateRenderPass) c->gdpa(c->dev, "vkCreateRenderPass");
+    if (!mk) return 0;
+    VkAttachmentDescription a = { .format = VK_FORMAT_D32_SFLOAT, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkAttachmentReference r = { 0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sp; memset(&sp, 0, sizeof(sp));
+    sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sp.colorAttachmentCount = 0; sp.pDepthStencilAttachment = &r;
+    VkSubpassDependency d = { .srcSubpass = VK_SUBPASS_EXTERNAL, .dstSubpass = 0,
+        .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, .dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT, .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT };
+    VkRenderPassCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 1,
+        .pAttachments = &a, .subpassCount = 1, .pSubpasses = &sp, .dependencyCount = 1, .pDependencies = &d };
+    return mk(c->dev, &ci, NULL, rp) == VK_SUCCESS;
+}
+static int mk_rp_scene(Ctx *c, VkRenderPass *rp) {
+    PFN_vkCreateRenderPass mk = (PFN_vkCreateRenderPass) c->gdpa(c->dev, "vkCreateRenderPass");
+    if (!mk) return 0;
+    VkAttachmentDescription a = { .format = VK_FORMAT_R8G8B8A8_UNORM, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkAttachmentReference r = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sp; memset(&sp, 0, sizeof(sp));
+    sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sp.colorAttachmentCount = 1; sp.pColorAttachments = &r;
+    VkRenderPassCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 1,
+        .pAttachments = &a, .subpassCount = 1, .pSubpasses = &sp };
+    return mk(c->dev, &ci, NULL, rp) == VK_SUCCESS;
+}
+/* 后处理 pass 的 render pass：结束布局直接是 TRANSFER_SRC（后面直接拷回 ✓ 省一次屏障 ✓）*/
+static int mk_rp_post(Ctx *c, VkRenderPass *rp) {
+    PFN_vkCreateRenderPass mk = (PFN_vkCreateRenderPass) c->gdpa(c->dev, "vkCreateRenderPass");
+    if (!mk) return 0;
+    VkAttachmentDescription a = { .format = VK_FORMAT_R8G8B8A8_UNORM, .samples = VK_SAMPLE_COUNT_1_BIT,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL };
+    VkAttachmentReference r = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sp; memset(&sp, 0, sizeof(sp));
+    sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS; sp.colorAttachmentCount = 1; sp.pColorAttachments = &r;
+    VkRenderPassCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 1,
+        .pAttachments = &a, .subpassCount = 1, .pSubpasses = &sp };
+    return mk(c->dev, &ci, NULL, rp) == VK_SUCCESS;
+}
+
+static VkSampler mk_sampler(Ctx *c, int compare) {
+    PFN_vkCreateSampler mk = (PFN_vkCreateSampler) c->gdpa(c->dev, "vkCreateSampler");
+    VkSampler s = NULL;
+    VkSamplerCreateInfo si = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .compareEnable = compare ? VK_TRUE : VK_FALSE, .compareOp = VK_COMPARE_OP_LESS_OR_EQUAL };
+    return (mk && mk(c->dev, &si, NULL, &s) == VK_SUCCESS) ? s : NULL;
+}
+
+
+/* albedo：程序化棋盘+渐变（64×64 ✓），经 staging 上传 */
+static int lit_mk_albedo(Ctx *c) {
+    const int N = 64;
+    uint8_t *px = (uint8_t *) malloc((size_t) N * N * 4);
+    if (!px) return 0;
+    for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
+        int chk = (((x >> 3) ^ (y >> 3)) & 1) ? 200 : 120;
+        uint8_t *p = px + ((size_t) y * N + x) * 4;
+        p[0] = (uint8_t) (chk * 0.85f); p[1] = (uint8_t) (chk * 0.90f); p[2] = (uint8_t) chk; p[3] = 255;
+    }
+    if (!mk_img(c, N, N, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, &g_litx.albedo, &g_litx.albedoMem)) {
+        LOG("  ! albedo: 图像创建失败\n"); free(px); return 0;
+    }
+    g_litx.albedoView = mk_view(c, g_litx.albedo, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    /* ★★ 这里原先是崩溃点（sig=11 addr=0x6f）：vkMapMemory 的返回值与 p 都没判 ✗
+     *    一旦拿到的内存类型不是 HOST_VISIBLE（pick_mem 走"回退告警"那条路 ✓），
+     *    映射就失败、p 保持 NULL ⇒ memcpy(NULL, …) 直接炸 ✓。现在每一步都判 ✓ */
+    VkBuffer st = NULL; VkDeviceMemory stm = NULL;
+    if (!mk_buf(c, (VkDeviceSize) N * N * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &st, &stm, 1)) {
+        LOG("  ! albedo: 暂存缓冲分配失败\n"); free(px); return 0;
+    }
+    PFN_vkMapMemory mp = (PFN_vkMapMemory) c->gdpa(c->dev, "vkMapMemory");
+    PFN_vkUnmapMemory um = (PFN_vkUnmapMemory) c->gdpa(c->dev, "vkUnmapMemory");
+    if (!mp || !um) { LOG("  ! albedo: 缺 map/unmap 入口\n"); free(px); return 0; }
+    void *p = NULL;
+    VkResult mr = mp(c->dev, stm, 0, VK_WHOLE_SIZE, 0, &p);
+    if (mr != VK_SUCCESS || !p) {
+        LOG("  ! albedo: 映射失败 r=%d p=%p ⇒ 得到的内存类型多半不是 HOST_VISIBLE（这是真问题，不是崩溃 ✓）\n", mr, p);
+        free(px); return 0;
+    }
+    memcpy(p, px, (size_t) N * N * 4);
+    um(c->dev, stm);
+    LOG("  · albedo: %d 字节已写入暂存缓冲 ✓\n", N * N * 4);
+    free(px);
+    PFN_vkBeginCommandBuffer bcb = (PFN_vkBeginCommandBuffer) c->gdpa(c->dev, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer ecb = (PFN_vkEndCommandBuffer) c->gdpa(c->dev, "vkEndCommandBuffer");
+    PFN_vkCmdPipelineBarrier bar = (PFN_vkCmdPipelineBarrier) c->gdpa(c->dev, "vkCmdPipelineBarrier");
+    /* 用自己的函数指针类型（不依赖头文件里的 typedef 形态 ✓）*/
+    typedef void (*PFN_c2i_own)(VkCommandBuffer, VkBuffer, VkImage, VkImageLayout, uint32_t, const VkBufferImageCopy *);
+    PFN_c2i_own c2i = (PFN_c2i_own) c->gdpa(c->dev, "vkCmdCopyBufferToImage");
+    PFN_vkQueueSubmit qs = (PFN_vkQueueSubmit) c->gdpa(c->dev, "vkQueueSubmit");
+    PFN_vkWaitForFences wf = (PFN_vkWaitForFences) c->gdpa(c->dev, "vkWaitForFences");
+    PFN_vkResetFences rf = (PFN_vkResetFences) c->gdpa(c->dev, "vkResetFences");
+    if (!bcb || !ecb || !bar || !c2i || !qs || !wf || !rf) { LOG("  ! albedo: 缺命令入口\n"); return 0; }
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    bcb(g_litx.cb, &bi);
+    VkImageMemoryBarrier b1 = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .image = g_litx.albedo, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    bar(g_litx.cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
+    VkBufferImageCopy cp = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { N, N, 1 } };
+    c2i(g_litx.cb, st, g_litx.albedo, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);   /* v9.7 修：去掉多传的 layout，改回标准 6 参数 ABI ✓ */
+    VkImageMemoryBarrier b2 = b1;
+    b2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    b2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b2.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    bar(g_litx.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b2);
+    ecb(g_litx.cb);
+    rf(c->dev, 1, &g_litx.fence);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_litx.cb };
+    return qs(c->q, 1, &si, g_litx.fence) == VK_SUCCESS && wf(c->dev, 1, &g_litx.fence, VK_TRUE, 1000000000ULL) == VK_SUCCESS;
+}
+
+/* 描述符：binding0 = 比较采样器 + 阴影贴图；binding1 = 采样器 + albedo */
+static int lit_mk_desc(Ctx *c) {
+    PFN_vkCreateDescriptorSetLayout mkdl = (PFN_vkCreateDescriptorSetLayout) c->gdpa(c->dev, "vkCreateDescriptorSetLayout");
+    PFN_vkCreateDescriptorPool mkdp = (PFN_vkCreateDescriptorPool) c->gdpa(c->dev, "vkCreateDescriptorPool");
+    PFN_vkAllocateDescriptorSets ads = (PFN_vkAllocateDescriptorSets) c->gdpa(c->dev, "vkAllocateDescriptorSets");
+    PFN_vkUpdateDescriptorSets uds = (PFN_vkUpdateDescriptorSets) c->gdpa(c->dev, "vkUpdateDescriptorSets");
+    if (!mkdl || !mkdp || !ads || !uds) return 0;
+    VkDescriptorSetLayoutBinding b[2]; memset(b, 0, sizeof(b));
+    for (int i = 0; i < 2; i++) {
+        b[i].binding = (uint32_t) i;
+        b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[i].descriptorCount = 1; b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dl = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b };
+    if (mkdl(c->dev, &dl, NULL, &g_litx.dsl) != VK_SUCCESS) return 0;
+    VkDescriptorPoolSize ps = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 };
+    VkDescriptorPoolCreateInfo dp = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &ps };
+    if (mkdp(c->dev, &dp, NULL, &g_litx.dpool) != VK_SUCCESS) return 0;
+    VkDescriptorSetAllocateInfo da = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = g_litx.dpool, .descriptorSetCount = 1, .pSetLayouts = &g_litx.dsl };
+    if (ads(c->dev, &da, &g_litx.dset) != VK_SUCCESS) return 0;
+    VkDescriptorImageInfo ii[2] = {
+        { g_litx.shadowSampler, g_litx.shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+        { g_litx.colorSampler,  g_litx.albedoView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } };
+    VkWriteDescriptorSet w[2]; memset(w, 0, sizeof(w));
+    for (int i = 0; i < 2; i++) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = g_litx.dset;
+        w[i].dstBinding = (uint32_t) i; w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w[i].pImageInfo = &ii[i];
+    }
+    uds(c->dev, 2, w, 0, NULL);
+    /* 后处理用的第二组：binding0 = 颜色画布（场景）、binding1 = 阴影图（调试视图用）✓ */
+    VkDescriptorSetAllocateInfo da2 = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = g_litx.dpool, .descriptorSetCount = 1, .pSetLayouts = &g_litx.dsl };
+    if (ads(c->dev, &da2, &g_litx.descPost) != VK_SUCCESS) return 0;
+    VkDescriptorImageInfo ip[2] = {
+        { g_litx.colorSampler, g_litx.colorView,   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+        { g_litx.shadowSampler, g_litx.shadowView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } };
+    VkWriteDescriptorSet wp[2]; memset(wp, 0, sizeof(wp));
+    for (int i = 0; i < 2; i++) {
+        wp[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; wp[i].dstSet = g_litx.descPost;
+        wp[i].dstBinding = (uint32_t) i; wp[i].descriptorCount = 1;
+        wp[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wp[i].pImageInfo = &ip[i];
+    }
+    uds(c->dev, 2, wp, 0, NULL);
+    return 1;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeLitInit(JNIEnv *env, jobject th, jstring jso, jint w, jint h) {
+    LOG("光影入口: nativeLitInit 进入\n");
+    (void) th;
+    const char *path = jso ? (*env)->GetStringUTFChars(env, jso, NULL) : NULL;
+    char out[300];
+    if (g_litx.ok) { ctx_close(&g_litx.ctx); memset(&g_litx, 0, sizeof(g_litx)); }
+    if (!ctx_open(&g_litx.ctx, path ? path : "system")) {
+        if (path) (*env)->ReleaseStringUTFChars(env, jso, path);
+        return (*env)->NewStringUTF(env, "光影：驱动不可用");
+    }
+    if (path) (*env)->ReleaseStringUTFChars(env, jso, path);
+    Ctx *c = &g_litx.ctx;
+    if ((int) w < 16 || (int) h < 16 || (int) w > 4096 || (int) h > 4096) {
+        ctx_close(c); memset(&g_litx, 0, sizeof(g_litx));
+        return (*env)->NewStringUTF(env, "光影：尺寸非法（需 16..4096）");
+    }
+    g_litx.w = (int) w; g_litx.h = (int) h;
+    int sr = g_lit.shadowRes; if (sr < 512) sr = 1024; g_litx.shadowRes = sr;
+    PFN_vkCreateCommandPool ccp = (PFN_vkCreateCommandPool) c->gdpa(c->dev, "vkCreateCommandPool");
+    PFN_vkAllocateCommandBuffers acb = (PFN_vkAllocateCommandBuffers) c->gdpa(c->dev, "vkAllocateCommandBuffers");
+    PFN_vkCreateFence cf = (PFN_vkCreateFence) c->gdpa(c->dev, "vkCreateFence");
+    if (!ccp || !acb || !cf) { ctx_close(c); memset(&g_litx, 0, sizeof(g_litx)); return (*env)->NewStringUTF(env, "光影：缺命令入口"); }
+    VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,   /* v9.9：每帧反复 begin 同一 CB 必须可重置（原先缺 ⇒ VUID 违规 ⇒ 录制不生效 ⇒ 画面不动）✓ */
+        .queueFamilyIndex = c->qfam };
+    ccp(c->dev, &cpci, NULL, &g_litx.cpool);
+    VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = g_litx.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    acb(c->dev, &cbai, &g_litx.cb);
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    cf(c->dev, &fci, NULL, &g_litx.fence);
+    /* 拆开链式调用：每一步单独判空 + 单独日志 ⇒ 崩溃/失败能精确落到某一步 ✓ */
+    LOG("  [L1] 建阴影贴图 %dx%d (D32)\n", sr, sr);
+    if (!mk_img(c, sr, sr, VK_FORMAT_D32_SFLOAT,
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, &g_litx.shadow, &g_litx.shadowMem)) {
+        ctx_close(c); memset(&g_litx, 0, sizeof(g_litx)); return (*env)->NewStringUTF(env, "光影：阴影贴图创建失败（显存？）");
+    }
+    LOG("  [L2] 阴影贴图视图\n");
+    g_litx.shadowView = mk_view(c, g_litx.shadow, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (!g_litx.shadowView) { ctx_close(c); memset(&g_litx, 0, sizeof(g_litx)); return (*env)->NewStringUTF(env, "光影：阴影视图失败"); }
+    LOG("  [L3] 建颜色画布 %dx%d\n", (int) w, (int) h);
+    if (!mk_img(c, (int) w, (int) h, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &g_litx.color, &g_litx.colorMem)) {
+        ctx_close(c); memset(&g_litx, 0, sizeof(g_litx)); return (*env)->NewStringUTF(env, "光影：颜色画布创建失败（显存？）");
+    }
+    LOG("  [L4] 颜色画布视图\n");
+    g_litx.colorView = mk_view(c, g_litx.color, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!g_litx.colorView) { ctx_close(c); memset(&g_litx, 0, sizeof(g_litx)); return (*env)->NewStringUTF(env, "光影：颜色视图失败"); }
+    LOG("  [L5] 建后处理画布 %dx%d\n", (int) w, (int) h);
+    if (!mk_img(c, (int) w, (int) h, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &g_litx.post, &g_litx.postMem)) {
+        ctx_close(c); memset(&g_litx, 0, sizeof(g_litx)); return (*env)->NewStringUTF(env, "光影：后处理画布创建失败（显存？）");
+    }
+    LOG("  [L6] 后处理画布视图\n");
+    g_litx.postView = mk_view(c, g_litx.post, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!g_litx.postView) { ctx_close(c); memset(&g_litx, 0, sizeof(g_litx)); return (*env)->NewStringUTF(env, "光影：后处理视图失败"); }
+    g_litx.shadowSampler = mk_sampler(c, 1);
+    g_litx.colorSampler = mk_sampler(c, 0);
+    if (!lit_mk_albedo(c)) { ctx_close(c); memset(&g_litx, 0, sizeof(g_litx)); return (*env)->NewStringUTF(env, "光影：albedo 纹理上传失败"); }
+    if (!mk_rp_depth(c, &g_litx.rpDepth) || !mk_rp_scene(c, &g_litx.rpScene) || !mk_rp_post(c, &g_litx.rpPost)) {
+        ctx_close(c); memset(&g_litx, 0, sizeof(g_litx)); return (*env)->NewStringUTF(env, "光影：render pass 创建失败");
+    }
+    if (!lit_mk_desc(c)) { ctx_close(c); memset(&g_litx, 0, sizeof(g_litx)); return (*env)->NewStringUTF(env, "光影：描述符创建失败"); }
+    g_litx.ok = 1;
+    snprintf(out, sizeof(out), "光影就绪 ✓ 阴影图 %d² · 画布 %dx%d · albedo 64² · 三条 pass（深度/光照/后处理）",
+             sr, (int) w, (int) h);
+    return (*env)->NewStringUTF(env, out);
+}
+
+
+/* 紧凑的 look-at × perspective（列主序 ✓ 不做通用求逆）*/
+static void lit_mvp(float *m, float aspect, const float *eye, const float *tgt, float fovy) {
+    float f[3] = { tgt[0]-eye[0], tgt[1]-eye[1], tgt[2]-eye[2] };
+    float fl = sqrtf(f[0]*f[0]+f[1]*f[1]+f[2]*f[2]); if (fl < 1e-6f) fl = 1;
+    for (int i = 0; i < 3; i++) f[i] /= fl;
+    float up[3] = { 0, 1, 0 };
+    float r[3] = { f[1]*up[2]-f[2]*up[1], f[2]*up[0]-f[0]*up[2], f[0]*up[1]-f[1]*up[0] };
+    float rl = sqrtf(r[0]*r[0]+r[1]*r[1]+r[2]*r[2]); if (rl < 1e-6f) { r[0]=1; r[1]=0; r[2]=0; rl=1; }
+    for (int i = 0; i < 3; i++) r[i] /= rl;
+    float u[3] = { r[1]*f[2]-r[2]*f[1], r[2]*f[0]-r[0]*f[2], r[0]*f[1]-r[1]*f[0] };
+    float t = tanf(fovy * 0.5f), n = 0.1f, fa = 100.0f;
+    for (int i = 0; i < 16; i++) m[i] = 0;
+    /* 列主序：view 的行点乘 + 投影缩放合并 */
+    m[0] = r[0]/(t*aspect); m[4] = r[1]/(t*aspect); m[8]  = r[2]/(t*aspect);
+    m[1] = u[0]/t;          m[5] = u[1]/t;          m[9]  = u[2]/t;
+    m[2] = -f[0];           m[6] = -f[1];           m[10] = -f[2];
+    m[12] = -(r[0]*eye[0]+r[1]*eye[1]+r[2]*eye[2])/(t*aspect);
+    m[13] = -(u[0]*eye[0]+u[1]*eye[1]+u[2]*eye[2])/t;
+    m[14] =  (f[0]*eye[0]+f[1]*eye[1]+f[2]*eye[2]);
+    m[15] = 1.0f;
+    /* 深度：Vulkan 0..1（把 z 从 [-1,1] 映射，简化处理 ✓）*/
+    m[10] = -f[2] * (fa/(fa-n)); m[14] = (f[0]*eye[0]+f[1]*eye[1]+f[2]*eye[2]) * (fa/(fa-n)) - (fa*n/(fa-n));
+}
+
+static int lit_mk_pipes(Ctx *c) {
+    PFN_vkCreateShaderModule mksh = (PFN_vkCreateShaderModule) c->gdpa(c->dev, "vkCreateShaderModule");
+    PFN_vkCreatePipelineLayout mkpl = (PFN_vkCreatePipelineLayout) c->gdpa(c->dev, "vkCreatePipelineLayout");
+    PFN_vkCreateGraphicsPipelines mkgp = (PFN_vkCreateGraphicsPipelines) c->gdpa(c->dev, "vkCreateGraphicsPipelines");
+    if (!mksh || !mkpl || !mkgp) return 0;
+    VkPushConstantRange pcr = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, .offset = 0, .size = sizeof(LitPC) };
+    VkPipelineLayoutCreateInfo pl = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+    if (mkpl(c->dev, &pl, NULL, &g_litx.plScene) != VK_SUCCESS) return 0;
+
+    VkPipelineShaderStageCreateInfo st; 
+    VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    VkPipelineViewportStateCreateInfo vps = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    VkPipelineColorBlendAttachmentState cba = { .colorWriteMask = 0xF };
+    VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1, .pAttachments = &cba };
+    VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dsi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 2, .pDynamicStates = dyn };
+    /* ① 深度管线（阴影 pass ✓ 无颜色附件）*/
+    { VkShaderModuleCreateInfo sm = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = depth_vert_spv_len * 4, .pCode = depth_vert_spv };
+      VkShaderModule mod = NULL; if (mksh(c->dev, &sm, NULL, &mod) != VK_SUCCESS) return 0;
+      st = (VkPipelineShaderStageCreateInfo){ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = mod, .pName = "main" };
+      VkPipelineColorBlendStateCreateInfo cb0 = cb; cb0.attachmentCount = 0; cb0.pAttachments = NULL;
+      VkGraphicsPipelineCreateInfo gp = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 1, .pStages = &st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+        .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms,
+        .pColorBlendState = &cb0, .pDepthStencilState = &ds, .pDynamicState = &dsi,
+        .layout = g_litx.plScene, .renderPass = g_litx.rpDepth, .subpass = 0 };
+      if (mkgp(c->dev, VK_NULL_HANDLE, 1, &gp, NULL, &g_litx.pipeDepth) != VK_SUCCESS) return 0; }
+    /* ② 光照管线（lit_vert + lit_frag ✓）*/
+    { VkShaderModuleCreateInfo sv = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = lit_vert_spv_len * 4, .pCode = lit_vert_spv };
+      VkShaderModuleCreateInfo sf = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = lit_frag2_spv_len * 4, .pCode = lit_frag2_spv };   /* v2：动态 PCF + 线性 ✓ */
+      VkShaderModule mv = NULL, mf = NULL;
+      if (mksh(c->dev, &sv, NULL, &mv) != VK_SUCCESS || mksh(c->dev, &sf, NULL, &mf) != VK_SUCCESS) return 0;
+      VkPipelineShaderStageCreateInfo st2[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = mv, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = mf, .pName = "main" } };
+      VkPipelineDepthStencilStateCreateInfo ds2 = ds; ds2.depthTestEnable = VK_FALSE; ds2.depthWriteEnable = VK_FALSE;
+      VkGraphicsPipelineCreateInfo gp = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2, .pStages = st2, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+        .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms,
+        .pColorBlendState = &cb, .pDepthStencilState = &ds2, .pDynamicState = &dsi,
+        .layout = g_litx.plScene, .renderPass = g_litx.rpScene, .subpass = 0 };
+      if (mkgp(c->dev, VK_NULL_HANDLE, 1, &gp, NULL, &g_litx.pipeScene) != VK_SUCCESS) return 0; }
+    return 1;
+    /* 后处理管线布局：同一套描述符（binding0=颜色画布 binding1=阴影图 ✓）+ 16 字节推常量 ✓ */
+    VkPushConstantRange pcr2 = { .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                 .offset = 0, .size = sizeof(LitPC2) };
+    VkPipelineLayoutCreateInfo pl2 = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1, .pSetLayouts = &g_litx.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr2 };
+    if (mkpl(c->dev, &pl2, NULL, &g_litx.plPost) != VK_SUCCESS) return 0;
+    { VkShaderModuleCreateInfo sv = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = post_vert_spv_len * 4, .pCode = post_vert_spv };
+      VkShaderModuleCreateInfo sf = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = post_frag2_spv_len * 4, .pCode = post_frag2_spv };
+      VkShaderModule mv = NULL, mf = NULL;
+      if (mksh(c->dev, &sv, NULL, &mv) != VK_SUCCESS || mksh(c->dev, &sf, NULL, &mf) != VK_SUCCESS) return 0;
+      VkPipelineShaderStageCreateInfo st3[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = mv, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = mf, .pName = "main" } };
+      VkPipelineDepthStencilStateCreateInfo ds3 = ds; ds3.depthTestEnable = VK_FALSE; ds3.depthWriteEnable = VK_FALSE;
+      VkGraphicsPipelineCreateInfo gp = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2, .pStages = st3, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+        .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms,
+        .pColorBlendState = &cb, .pDepthStencilState = &ds3, .pDynamicState = &dsi,
+        .layout = g_litx.plPost, .renderPass = g_litx.rpPost, .subpass = 0 };
+      if (mkgp(c->dev, VK_NULL_HANDLE, 1, &gp, NULL, &g_litx.pipePost) != VK_SUCCESS) return 0; }
+}
+static int lit_mk_fbs(Ctx *c) {
+    PFN_vkCreateFramebuffer mk = (PFN_vkCreateFramebuffer) c->gdpa(c->dev, "vkCreateFramebuffer");
+    if (!mk) return 0;
+    VkImageView a = g_litx.shadowView;
+    VkFramebufferCreateInfo f1 = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g_litx.rpDepth,
+        .attachmentCount = 1, .pAttachments = &a, .width = (uint32_t) g_litx.shadowRes, .height = (uint32_t) g_litx.shadowRes, .layers = 1 };
+    if (mk(c->dev, &f1, NULL, &g_litx.fbShadow) != VK_SUCCESS) return 0;
+    VkImageView b = g_litx.colorView;
+    VkFramebufferCreateInfo f2 = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g_litx.rpScene,
+        .attachmentCount = 1, .pAttachments = &b, .width = (uint32_t) g_litx.w, .height = (uint32_t) g_litx.h, .layers = 1 };
+    if (mk(c->dev, &f2, NULL, &g_litx.fbScene) != VK_SUCCESS) return 0;
+    VkImageView pv = g_litx.postView;
+    VkFramebufferCreateInfo f3 = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g_litx.rpPost,
+        .attachmentCount = 1, .pAttachments = &pv, .width = (uint32_t) g_litx.w, .height = (uint32_t) g_litx.h, .layers = 1 };
+    return mk(c->dev, &f3, NULL, &g_litx.fbPost) == VK_SUCCESS;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeLitFrame(JNIEnv *env, jobject th) {
+    LOG("光影入口: nativeLitFrame 进入\n");
+    (void) th;
+    char out[448];
+    if (!g_litx.ok) return (*env)->NewStringUTF(env, "光影未初始化");
+    Ctx *c = &g_litx.ctx;
+    if (!g_litx.pipeScene) {
+        if (!lit_mk_pipes(c)) return (*env)->NewStringUTF(env, "X 光影管线创建失败");
+        if (!lit_mk_fbs(c))   return (*env)->NewStringUTF(env, "X 光影 framebuffer 创建失败");
+        if (!g_litx.rbuf && !mk_buf(c, (VkDeviceSize) g_litx.w * g_litx.h * 4,
+                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g_litx.rbuf, &g_litx.rMem, 1))
+            return (*env)->NewStringUTF(env, "X 光影回读缓冲失败");
+        /* v8.8 修复：这里原先是 (Timer *)&g_litx.qp 的强转 —— 把约 48 字节的 Timer
+         * 写进 8 字节的 VkQueryPool 字段 ⇒ 越界砸坏结构后面的内存 ⇒ 第一次
+         * nativeLitFrame 就野指针崩（addr=0x6f）✗。真正的计时器在下面 static Timer ltm ✓ */
+    }
+    static Timer ltm; static int ltInit = 0;
+    if (!ltInit) { ltInit = 1; if (!timer_init(c, &ltm, 2)) g_litx.tsOk = 0; else g_litx.tsOk = 1; }
+    PFN_vkBeginCommandBuffer bcb = (PFN_vkBeginCommandBuffer) c->gdpa(c->dev, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer ecb = (PFN_vkEndCommandBuffer) c->gdpa(c->dev, "vkEndCommandBuffer");
+    PFN_vkCmdBeginRenderPass brp = (PFN_vkCmdBeginRenderPass) c->gdpa(c->dev, "vkCmdBeginRenderPass");
+    PFN_vkCmdEndRenderPass erp = (PFN_vkCmdEndRenderPass) c->gdpa(c->dev, "vkCmdEndRenderPass");
+    PFN_vkCmdBindPipeline bp = (PFN_vkCmdBindPipeline) c->gdpa(c->dev, "vkCmdBindPipeline");
+    PFN_vkCmdBindDescriptorSets bds = (PFN_vkCmdBindDescriptorSets) c->gdpa(c->dev, "vkCmdBindDescriptorSets");
+    PFN_vkCmdPushConstants pc_ = (PFN_vkCmdPushConstants) c->gdpa(c->dev, "vkCmdPushConstants");
+    PFN_vkCmdDraw dr = (PFN_vkCmdDraw) c->gdpa(c->dev, "vkCmdDraw");
+    PFN_vkCmdSetViewport sv = (PFN_vkCmdSetViewport) c->gdpa(c->dev, "vkCmdSetViewport");
+    PFN_vkCmdSetScissor ss = (PFN_vkCmdSetScissor) c->gdpa(c->dev, "vkCmdSetScissor");
+    PFN_vkCmdPipelineBarrier bar = (PFN_vkCmdPipelineBarrier) c->gdpa(c->dev, "vkCmdPipelineBarrier");
+    PFN_vkCmdCopyImageToBuffer c2b = (PFN_vkCmdCopyImageToBuffer) c->gdpa(c->dev, "vkCmdCopyImageToBuffer");
+    PFN_vkQueueSubmit qs = (PFN_vkQueueSubmit) c->gdpa(c->dev, "vkQueueSubmit");
+    PFN_vkWaitForFences wf = (PFN_vkWaitForFences) c->gdpa(c->dev, "vkWaitForFences");
+    PFN_vkResetFences rf = (PFN_vkResetFences) c->gdpa(c->dev, "vkResetFences");
+    if (!bcb||!ecb||!brp||!erp||!bp||!bds||!pc_||!dr||!sv||!ss||!bar||!c2b||!qs||!wf||!rf)
+        return (*env)->NewStringUTF(env, "X 光影命令入口缺失");
+    float eye[3] = { 4.0f, 3.2f, 4.0f }, tgt[3] = { 0, 1.0f, 0 };
+    float lightEye[3] = { 4.0f, 6.0f, 2.0f };
+    LitPC pk; memset(&pk, 0, sizeof(pk));
+    lit_mvp(pk.mvp, (float) g_litx.w / (float) g_litx.h, eye, tgt, 0.9f);
+    lit_mvp(pk.lightVP, 1.0f, lightEye, tgt, 1.2f);
+    int nInst = g_lit.cubes; pk.nInst = nInst;
+    pk.t = g_lit.animate ? (float) (now_ms() / 1000.0) : 0.0f;   /* 动画开关 ✓ */
+    pk.pcf = g_lit.pcfTaps;                                      /* PCF 质量开关 ✓ */
+    pk.shadows = g_lit.shadows;                                  /* 阴影开关 ✓ */
+    pk.shadowRes = g_litx.shadowRes;                             /* 阴影图分辨率开关 ✓ */
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    double t0 = now_ms();
+    if (bcb(g_litx.cb, &bi) != VK_SUCCESS) return (*env)->NewStringUTF(env, "X begin 失败");
+    if (g_litx.tsOk) timer_begin(&ltm, g_litx.cb);
+    /* ① 阴影 pass */
+    VkClearValue cd; memset(&cd, 0, sizeof(cd)); cd.depthStencil = (VkClearDepthStencilValue){ 1.0f, 0 };
+    VkRenderPassBeginInfo r1 = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g_litx.rpDepth,
+        .framebuffer = g_litx.fbShadow, .renderArea = { {0,0}, { (uint32_t) g_litx.shadowRes, (uint32_t) g_litx.shadowRes } },
+        .clearValueCount = 1, .pClearValues = &cd };
+    brp(g_litx.cb, &r1, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport v1 = { 0, 0, (float) g_litx.shadowRes, (float) g_litx.shadowRes, 0, 1 };
+    VkRect2D s1 = { {0,0}, { (uint32_t) g_litx.shadowRes, (uint32_t) g_litx.shadowRes } };
+    sv(g_litx.cb, 0, 1, &v1); ss(g_litx.cb, 0, 1, &s1);
+    bp(g_litx.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_litx.pipeDepth);
+    pc_(g_litx.cb, g_litx.plScene, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pk), &pk);
+    dr(g_litx.cb, 36, (uint32_t) nInst, 0, 0);
+    erp(g_litx.cb);
+    /* ② 光照 pass（阴影图已被 render pass 转到 SHADER_READ_ONLY ✓）*/
+    VkClearValue cc; memset(&cc, 0, sizeof(cc)); cc.color.float32[0] = 0.05f; cc.color.float32[1] = 0.06f; cc.color.float32[2] = 0.08f; cc.color.float32[3] = 1;
+    VkViewport v2 = { 0, 0, (float) g_litx.w, (float) g_litx.h, 0, 1 };
+    VkRect2D s2 = { {0,0}, { (uint32_t) g_litx.w, (uint32_t) g_litx.h } };
+    int reps = g_lit.passesPerFrame; if (reps < 1) reps = 1;    /* 负载倍率开关 ✓ 真的重复跑 */
+    for (int rep = 0; rep < reps; rep++) {
+        VkRenderPassBeginInfo r2 = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g_litx.rpScene,
+            .framebuffer = g_litx.fbScene, .renderArea = { {0,0}, { (uint32_t) g_litx.w, (uint32_t) g_litx.h } },
+            .clearValueCount = 1, .pClearValues = &cc };
+        brp(g_litx.cb, &r2, VK_SUBPASS_CONTENTS_INLINE);
+        sv(g_litx.cb, 0, 1, &v2); ss(g_litx.cb, 0, 1, &s2);
+        bp(g_litx.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_litx.pipeScene);
+        bds(g_litx.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_litx.plScene, 0, 1, &g_litx.dset, 0, NULL);
+        pc_(g_litx.cb, g_litx.plScene, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pk), &pk);
+        dr(g_litx.cb, 36, (uint32_t) nInst, 0, 0);
+        erp(g_litx.cb);
+    }
+    /* ③ 后处理 pass（泛光 / 色调映射 / 调试视图 —— 三个开关在这里生效 ✓）*/
+    if (g_litx.pipePost) {
+        VkRenderPassBeginInfo r3 = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = g_litx.rpPost,
+            .framebuffer = g_litx.fbPost, .renderArea = { {0,0}, { (uint32_t) g_litx.w, (uint32_t) g_litx.h } },
+            .clearValueCount = 1, .pClearValues = &cc };
+        brp(g_litx.cb, &r3, VK_SUBPASS_CONTENTS_INLINE);
+        VkViewport v3 = { 0, 0, (float) g_litx.w, (float) g_litx.h, 0, 1 };
+        VkRect2D s3 = { {0,0}, { (uint32_t) g_litx.w, (uint32_t) g_litx.h } };
+        sv(g_litx.cb, 0, 1, &v3); ss(g_litx.cb, 0, 1, &s3);
+        bp(g_litx.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_litx.pipePost);
+        bds(g_litx.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_litx.plPost, 0, 1, &g_litx.descPost, 0, NULL);
+        LitPC2 p2 = { g_lit.bloom, g_lit.tonemap, g_lit.debugView, 1.0f / (float) (g_litx.w > 0 ? g_litx.w : 1) };
+        pc_(g_litx.cb, g_litx.plPost, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(p2), &p2);
+        dr(g_litx.cb, 3, 1, 0, 0);              /* 全屏三角形 ✓ */
+        erp(g_litx.cb);
+    }
+    if (g_litx.tsOk) timer_end(&ltm, g_litx.cb);
+    /* ④ 回读（后处理画布的 render pass 结束布局已是 TRANSFER_SRC ⇒ 无需额外屏障 ✓；没建后处理时退回颜色画布 ✓）*/
+    VkImage srcImg = g_litx.pipePost ? g_litx.post : g_litx.color;
+    if (!g_litx.pipePost) {
+        VkImageMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .image = g_litx.color, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+        bar(g_litx.cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    }
+    VkBufferImageCopy bc = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { (uint32_t) g_litx.w, (uint32_t) g_litx.h, 1 } };
+    c2b(g_litx.cb, srcImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_litx.rbuf, 1, &bc);
+    ecb(g_litx.cb);
+    rf(c->dev, 1, &g_litx.fence);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_litx.cb };
+    VkResult r = qs(c->q, 1, &si, g_litx.fence);
+    if (r == VK_SUCCESS) r = wf(c->dev, 1, &g_litx.fence, VK_TRUE, 3000000000ULL);
+    double t1 = now_ms();
+    double gms = g_litx.tsOk ? timer_result_ms(c, &ltm) : -1.0;
+    /* v9.9 诊断：把回读缓冲映射一下采 3 个统计量 ⇒ 下次若还是没画面，一眼分辨
+     *   「GPU 没写像素」还是「写进去了但是黑的」✓ */
+    double pxmin = -1, pxmax = -1, pxavg = -1;
+    {
+        PFN_vkMapMemory pmp = (PFN_vkMapMemory) c->gdpa(c->dev, "vkMapMemory");
+        PFN_vkUnmapMemory pum = (PFN_vkUnmapMemory) c->gdpa(c->dev, "vkUnmapMemory");
+        void *pp = NULL;
+        if (pmp && pum && pmp(c->dev, g_litx.rMem, 0, VK_WHOLE_SIZE, 0, &pp) == VK_SUCCESS && pp) {
+            unsigned char *bb = (unsigned char *) pp;
+            size_t tot = (size_t) g_litx.w * g_litx.h * 4, sum = 0, cnt = 0; int mn = 255, mx = 0;
+            for (size_t i = 0; i < tot; i += 64) { int v = bb[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += (size_t) v; cnt++; }
+            if (cnt) { pxmin = mn; pxmax = mx; pxavg = (double) sum / (double) cnt; }
+            pum(c->dev, g_litx.rMem);
+        }
+    }
+    if (r != VK_SUCCESS)
+        snprintf(out, sizeof(out), "X 光影提交失败 r=%d（%s）实例=%d —— 这一帧保留", r,
+                 r == -4 ? "VK_ERROR_DEVICE_LOST" : "见 VkResult 表", nInst);
+    else
+        snprintf(out, sizeof(out), "光影完成 ✓ 2 pass（深度 %d² + 光照 %dx%d）· 实例 %d · 阴影=%s PCF=%d · GPU %.2f ms · 墙钟 %.2f ms · %.1f FPS · 占空比 %.1f%% · 像素 min %.0f/max %.0f/均 %.1f",
+                 g_litx.shadowRes, g_litx.w, g_litx.h, nInst, g_lit.shadows ? "开" : "关", g_lit.pcfTaps,
+                 gms, t1 - t0, (t1 - t0) > 0 ? 1000.0 / (t1 - t0) : 0.0, (gms > 0 && (t1 - t0) > 0) ? 100.0 * gms / (t1 - t0) : 0.0, pxmin, pxmax, pxavg);
+    return (*env)->NewStringUTF(env, out);
+}
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeLitBlit(JNIEnv *env, jobject th, jobject bmp) {
+    LOG("光影入口: nativeLitBlit 进入\n");
+    (void) th;
+    if (!g_litx.ok || !g_litx.rbuf) return (*env)->NewStringUTF(env, "光影无图像");
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bmp, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return (*env)->NewStringUTF(env, "取位图信息失败");
+    void *pix = NULL;
+    if (AndroidBitmap_lockPixels(env, bmp, &pix) != ANDROID_BITMAP_RESULT_SUCCESS) return (*env)->NewStringUTF(env, "锁定位图失败");
+    PFN_vkMapMemory mp = (PFN_vkMapMemory) g_litx.ctx.gdpa(g_litx.ctx.dev, "vkMapMemory");
+    PFN_vkUnmapMemory um = (PFN_vkUnmapMemory) g_litx.ctx.gdpa(g_litx.ctx.dev, "vkUnmapMemory");
+    void *src = NULL;
+    if (mp && mp(g_litx.ctx.dev, g_litx.rMem, 0, VK_WHOLE_SIZE, 0, &src) == VK_SUCCESS && src) {
+        int cw = g_litx.w < (int) info.width ? g_litx.w : (int) info.width;
+        int ch = g_litx.h < (int) info.height ? g_litx.h : (int) info.height;
+        for (int y = 0; y < ch; y++) {
+            uint8_t *dst = (uint8_t *) pix + (size_t) y * info.stride;
+            memcpy(dst, (const uint8_t *) src + (size_t) y * g_litx.w * 4, (size_t) cw * 4);
+        }
+        um(g_litx.ctx.dev, g_litx.rMem);
+    }
+    AndroidBitmap_unlockPixels(env, bmp);
+    return (*env)->NewStringUTF(env, "已拷入位图");
+}
+JNIEXPORT void JNICALL
+Java_com_dsh_gputest_MainActivity_nativeLitStop(JNIEnv *env, jobject th) {
+    LOG("光影入口: nativeLitStop 进入\n");
+    (void) th;
+    if (g_litx.ok) { ctx_close(&g_litx.ctx); memset(&g_litx, 0, sizeof(g_litx)); }
+    /* 返回类型已改为 void（与 Java 声明一致 ✓）*/
+}
+
+
+// ============================================================================
+//  v8.1 · CPU 光追参考图（逐像素光线求交，**纯 CPU** ⇒ 任何驱动都能出）
+//  用途：驱动不支持硬件光追时（如 PanVK）也有真产出；结果必须标注「非硬件光追」✓
+//  实现：地面 + 3 球，主光线 + 4 次抖动阴影采样（软阴影）+ 1 次反射 ✓
+// ============================================================================
+static uint32_t *g_cpurt = NULL; static int g_cpurt_w = 0, g_cpurt_h = 0;
+typedef struct { float r, g, b; } C3;
+static const float RT_EYE[3] = { 3.0f, 2.6f, 4.2f };
+static const float RT_LIGHT[3] = { 4.5f, 6.0f, 3.0f };
+static const float RT_SPH[3][4] = {           /* x,y,z,r */
+    { -1.30f, 0.85f, 0.10f, 0.85f },
+    {  0.25f, 0.60f,-0.90f, 0.60f },
+    {  1.35f, 1.00f, 0.55f, 1.00f } };
+static const C3 RT_COL[3] = { { 0.85f, 0.25f, 0.25f }, { 0.25f, 0.75f, 0.35f }, { 0.30f, 0.45f, 0.90f } };
+
+static int rt_hit_spheres(const float *o, const float *d, float *t, float *n, int *mi) {
+    int hit = 0; float best = 1e30f;
+    for (int i = 0; i < 3; i++) {
+        float ox = o[0]-RT_SPH[i][0], oy = o[1]-RT_SPH[i][1], oz = o[2]-RT_SPH[i][2];
+        float b = ox*d[0]+oy*d[1]+oz*d[2];
+        float c = ox*ox+oy*oy+oz*oz - RT_SPH[i][3]*RT_SPH[i][3];
+        float disc = b*b - c;
+        if (disc < 0) continue;
+        float q = -b - sqrtf(disc);
+        if (q > 1e-3f && q < best) {
+            best = q; hit = 1; *mi = i;
+            float px = o[0]+d[0]*q-RT_SPH[i][0], py = o[1]+d[1]*q-RT_SPH[i][1], pz = o[2]+d[2]*q-RT_SPH[i][2];
+            float l = sqrtf(px*px+py*py+pz*pz); if (l < 1e-6f) l = 1;
+            n[0] = px/l; n[1] = py/l; n[2] = pz/l;
+        }
+    }
+    if (hit) *t = best;
+    return hit;
+}
+static int rt_hit(const float *o, const float *d, float *t, float *n, C3 *col) {
+    float ts, ns[3]; int mi = 0;
+    int hs = rt_hit_spheres(o, d, &ts, ns, &mi);
+    float tp = 1e30f;
+    if (d[1] < -1e-6f) { float q = -(o[1] - 0.0f) / d[1]; if (q > 1e-3f) tp = q; }
+    if (!hs && tp >= 1e30f) return 0;
+    if (hs && ts < tp) { *t = ts; n[0]=ns[0]; n[1]=ns[1]; n[2]=ns[2]; *col = RT_COL[mi]; }
+    else {
+        *t = tp;
+        float px = o[0]+d[0]*tp, pz = o[2]+d[2]*tp;
+        n[0] = 0; n[1] = 1; n[2] = 0;
+        int chk = (((int) floorf(px * 1.5f)) + ((int) floorf(pz * 1.5f))) & 1;
+        col->r = chk ? 0.75f : 0.55f; col->g = chk ? 0.75f : 0.55f; col->b = chk ? 0.78f : 0.58f;
+    }
+    return 1;
+}
+static int rt_occluded(const float *p, const float *ld) {
+    float t, n[3]; C3 c;
+    return rt_hit(p, ld, &t, n, &c) && t < 1e30f;
+}
+static C3 rt_trace(const float *o, const float *d, int depth) {
+    float t, n[3]; C3 albedo;
+    C3 out = { 0.05f, 0.07f, 0.11f };                 /* 背景 */
+    if (!rt_hit(o, d, &t, n, &albedo)) return out;
+    float p[3] = { o[0]+d[0]*t, o[1]+d[1]*t, o[2]+d[2]*t };
+    float L[3] = { RT_LIGHT[0]-p[0], RT_LIGHT[1]-p[1], RT_LIGHT[2]-p[2] };
+    float ll = sqrtf(L[0]*L[0]+L[1]*L[1]+L[2]*L[2]); if (ll < 1e-6f) ll = 1;
+    L[0]/=ll; L[1]/=ll; L[2]/=ll;
+    float ndl = n[0]*L[0]+n[1]*L[1]+n[2]*L[2]; if (ndl < 0) ndl = 0;
+    /* 软阴影：4 次抖动 ✓ */
+    float sh = 0.0f;
+    const float j[4][2] = { { 0,0 }, { 0.06f,0 }, { 0,0.06f }, { -0.04f,-0.04f } };
+    for (int k = 0; k < 4; k++) {
+        float ld[3] = { L[0]+j[k][0], L[1], L[2]+j[k][1] };
+        float l2 = sqrtf(ld[0]*ld[0]+ld[1]*ld[1]+ld[2]*ld[2]); if (l2<1e-6f) l2=1;
+        ld[0]/=l2; ld[1]/=l2; ld[2]/=l2;
+        float pp[3] = { p[0]+n[0]*0.002f, p[1]+n[1]*0.002f, p[2]+n[2]*0.002f };
+        if (!rt_occluded(pp, ld)) sh += 0.25f;
+    }
+    float amb = 0.18f, diff = ndl * sh;
+    out.r = albedo.r * (amb + 0.9f * diff); out.g = albedo.g * (amb + 0.9f * diff); out.b = albedo.b * (amb + 0.9f * diff);
+    /* 一次反射 ✓ */
+    if (depth < 1) {
+        float dn = d[0]*n[0]+d[1]*n[1]+d[2]*n[2];
+        float rd[3] = { d[0]-2*dn*n[0], d[1]-2*dn*n[1], d[2]-2*dn*n[2] };
+        float rp[3] = { p[0]+n[0]*0.003f, p[1]+n[1]*0.003f, p[2]+n[2]*0.003f };
+        C3 rc = rt_trace(rp, rd, depth + 1);
+        out.r += rc.r * 0.28f * albedo.r; out.g += rc.g * 0.28f * albedo.g; out.b += rc.b * 0.28f * albedo.b;
+    }
+    return out;
+}
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeCpuRtInit(JNIEnv *env, jobject th, jint w, jint h) {
+    LOG("原生入口: nativeCpuRtInit 进入\n");
+    (void) th;
+    int W = (int) w, H = (int) h;
+    if (W < 16) W = 256; if (H < 16) H = 256;
+    free(g_cpurt); g_cpurt = (uint32_t *) malloc((size_t) W * H * 4);
+    g_cpurt_w = W; g_cpurt_h = H;
+    char out[128];
+    snprintf(out, sizeof(out), g_cpurt ? "CPU 光追缓冲就绪 %dx%d（非硬件光追 ✓）" : "CPU 光追分配失败", W, H);
+    return (*env)->NewStringUTF(env, out);
+}
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeCpuRtRender(JNIEnv *env, jobject th, jint frame) {
+    LOG("原生入口: nativeCpuRtRender 进入\n");
+    (void) th;
+    if (!g_cpurt) return (*env)->NewStringUTF(env, "CPU 光追未初始化");
+    int W = g_cpurt_w, H = g_cpurt_h;
+    float aspect = (float) W / (float) H;
+    float fwd[3] = { -RT_EYE[0], 1.0f - RT_EYE[1], -RT_EYE[2] };
+    float fl = sqrtf(fwd[0]*fwd[0]+fwd[1]*fwd[1]+fwd[2]*fwd[2]); fwd[0]/=fl; fwd[1]/=fl; fwd[2]/=fl;
+    float rt[3] = { fwd[2], 0, -fwd[0] };
+    float rl = sqrtf(rt[0]*rt[0]+rt[2]*rt[2]); if (rl < 1e-6f) rl = 1; rt[0]/=rl; rt[2]/=rl;
+    float up[3] = { rt[1]*fwd[2]-rt[2]*fwd[1], rt[2]*fwd[0]-rt[0]*fwd[2], rt[0]*fwd[1]-rt[1]*fwd[0] };
+    float th2 = tanf(0.9f * 0.5f);
+    double t0 = now_ms();
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            float u = ((float) x + 0.5f) / (float) W * 2.0f - 1.0f;
+            float v = 1.0f - ((float) y + 0.5f) / (float) H * 2.0f;
+            float d[3] = { fwd[0] + rt[0]*u*th2*aspect + up[0]*v*th2,
+                           fwd[1] + rt[1]*u*th2*aspect + up[1]*v*th2,
+                           fwd[2] + rt[2]*u*th2*aspect + up[2]*v*th2 };
+            float dl = sqrtf(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]); d[0]/=dl; d[1]/=dl; d[2]/=dl;
+            C3 c = rt_trace(RT_EYE, d, 0);
+            /* 色调映射 + 伽马（CPU 侧也走同一套 ✓）*/
+            c.r = c.r/(c.r+1.0f); c.g = c.g/(c.g+1.0f); c.b = c.b/(c.b+1.0f);
+            c.r = powf(c.r, 1.0f/2.2f); c.g = powf(c.g, 1.0f/2.2f); c.b = powf(c.b, 1.0f/2.2f);
+            g_cpurt[(size_t) y * W + x] = 0xFF000000u
+                | ((uint32_t) (c.r * 255.0f) << 16) | ((uint32_t) (c.g * 255.0f) << 8) | (uint32_t) (c.b * 255.0f);
+        }
+    }
+    double dt = now_ms() - t0;
+    char out[220];
+    snprintf(out, sizeof(out),
+        "CPU 光追完成（**非硬件光追** ✓）%dx%d · 地面+3 球 · 4 次软阴影采样 + 1 次反射 · 用时 %.0f ms · %.1f 万光线/s · frame=%d",
+        W, H, dt, dt > 0 ? (double) W * H / dt / 100.0 : 0.0, (int) frame);
+    return (*env)->NewStringUTF(env, out);
+}
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeCpuRtBlit(JNIEnv *env, jobject th, jobject bmp) {
+    LOG("原生入口: nativeCpuRtBlit 进入\n");
+    (void) th;
+    if (!g_cpurt) return (*env)->NewStringUTF(env, "CPU 光追无图像");
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bmp, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return (*env)->NewStringUTF(env, "取位图信息失败");
+    void *pix = NULL;
+    if (AndroidBitmap_lockPixels(env, bmp, &pix) != ANDROID_BITMAP_RESULT_SUCCESS) return (*env)->NewStringUTF(env, "锁定位图失败");
+    int cw = g_cpurt_w < (int) info.width ? g_cpurt_w : (int) info.width;
+    int ch = g_cpurt_h < (int) info.height ? g_cpurt_h : (int) info.height;
+    for (int y = 0; y < ch; y++) {
+        uint8_t *dst = (uint8_t *) pix + (size_t) y * info.stride;
+        memcpy(dst, (const uint8_t *) (g_cpurt + (size_t) y * g_cpurt_w), (size_t) cw * 4);
+    }
+    AndroidBitmap_unlockPixels(env, bmp);
+    return (*env)->NewStringUTF(env, "已拷入位图");
+}
+
+
+// ============================================================================
+//  v8.4 · 转译链（渲染器 × 驱动）第一步：准备运行环境
+//  原理（学 FCL/ZL2）：渲染器（Zink/MobileGL 等，说的是 GL/EGL）会去 dlopen("libvulkan.so")，
+//  我们**把转发垫片打包成 libvulkan.so** ⇒ 它先命中我们的垫片 ⇒ 垫片按 DRIVER_PATH 转发到
+//  **用户选中的 Vulkan 驱动** ✓。本函数只做"设环境 + 校验垫片在位"，**不加载渲染器** ✓
+//  （加载 GL 实现有崩溃风险，那一步单独设计、单独开关 ✓）
+// ============================================================================
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeTranscodePrepare(JNIEnv *env, jobject th, jstring jdrv) {
+    (void) th;
+    const char *drv = jdrv ? (*env)->GetStringUTFChars(env, jdrv, NULL) : NULL;
+    char out[420];
+    if (!drv || !*drv) {
+        if (drv) (*env)->ReleaseStringUTFChars(env, jdrv, drv);
+        return (*env)->NewStringUTF(env, "转译准备：没有选中的驱动（先在①里选一个 ✓）");
+    }
+    /* ① 垫片是否随包在位（我们打进 lib/arm64-v8a/libvulkan.so ✓）*/
+    int shim = 0;
+    { void *h = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+      if (h) { shim = dlsym(h, "vkGetInstanceProcAddr") ? 1 : 0; }
+      /* 刻意不 dlclose：垫片要被后续渲染器复用 ✓ */ }
+    /* ② 关键：把选中驱动告诉垫片（vkshim_icd.c 读的就是 DRIVER_PATH ✓）*/
+    setenv("DRIVER_PATH", drv, 1);
+    /* ③ 顺手把渲染器/驱动都可能用到的环境也备好（学启动器的做法 ✓ 但**不猜**渲染器私有变量 ✗）*/
+    setenv("VK_LOADER_DEBUG", "error", 1);
+    snprintf(out, sizeof(out),
+        "转译环境就绪 ✓\n"
+        "  DRIVER_PATH = %s\n"
+        "  转发垫片 libvulkan.so：%s\n"
+        "  说明：渲染器（Zink/MobileGL 等）一旦调用 dlopen(\"libvulkan.so\")，就会命中我们的垫片，\n"
+        "        再由它把全部 Vulkan 调用转发到上面这个驱动 ✓（与 FCL/ZL2 同一套机制 ✓）",
+        drv, shim ? "已在包内并可加载 ✓（垫片已接管 libvulkan.so ✓）"
+                  : "不在包内 ✗（构建时少了它 ⇒ 转译链无法工作，请检查 lib/arm64-v8a/libvulkan.so）");
+    (*env)->ReleaseStringUTFChars(env, jdrv, drv);
+    return (*env)->NewStringUTF(env, out);
+}
+
 // ---------------------------------------------------------------- 跑分内核
 typedef struct { double secs; unsigned long long ops, subs, fails; double sum_us; double gpu_ms; int gpu_ok; double bytes_per_op; double pixels_per_op; } BenchStat;
 
@@ -574,6 +1930,11 @@ static void bench_report(const char *label, BenchStat *b) {
 // fill：全屏三角形 + 可放大片元负载（**不是** vkCmdClearColorImage —— 清屏不是填充测试）
 // 依据 glmark2 的 fragment-steps 思路：用 push constant 放大每像素负载
 // 计时用 GPU 时间戳（Khronos timestamp_queries 口径）
+/* v6.5：成绩分母 —— 有 GPU 时间戳就用 GPU 时间（否则退回墙钟） */
+static double score_den(const BenchStat *b) {
+    return (b->gpu_ok && b->gpu_ms > 0) ? b->gpu_ms / 1000.0 : b->secs;
+}
+
 static int bench_fill(Ctx *c, Target *t, double seconds, BenchStat *st) {
     PFN_vkCreateShaderModule mksh = (PFN_vkCreateShaderModule) c->gdpa(c->dev, "vkCreateShaderModule");
     PFN_vkCreatePipelineLayout mkpl = (PFN_vkCreatePipelineLayout) c->gdpa(c->dev, "vkCreatePipelineLayout");
@@ -803,6 +2164,7 @@ static int make_tri_pipeline(Ctx *c, VkRenderPass rp, VkPipeline *out_pipe, VkPi
 
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeBench(JNIEnv *env, jobject th, jstring jso, jint seconds, jstring jmode) {
+    LOG("原生入口: nativeBench 进入\n");
     (void) th; g_len = 0; g_log[0] = 0;
     const char *path = (*env)->GetStringUTFChars(env, jso, NULL);
     const char *mode = jmode ? (*env)->GetStringUTFChars(env, jmode, NULL) : "fill";
@@ -817,11 +2179,11 @@ Java_com_dsh_gputest_MainActivity_nativeBench(JNIEnv *env, jobject th, jstring j
         int ok = 0;
         if (!strcmp(mode, "fill")) {
             ok = bench_fill(&c, &t, secs, &st); bench_report("fill 填充率", &st);
-            if (ok) LOG("\n== 分数(fill) = %.0f Mpixel/s ==\n", st.ops * st.pixels_per_op / 1e6 / st.secs);
+            if (ok) LOG("\n== 分数(fill) = %.0f Mpixel/s ==\n", st.ops * st.pixels_per_op / 1e6 / score_den(&st));
         } else if (!strcmp(mode, "blit")) {
             if (!target_make(&c, &t2, 1024, 1024, 0)) { LOG("X 第二目标创建失败\n"); goto out2; }
             ok = bench_blit(&c, &t, &t2, secs, &st); bench_report("blit 拷贝带宽", &st);
-            if (ok) LOG("\n== 分数(blit) = %.2f GB/s ==\n", st.ops * st.bytes_per_op / 1e9 / st.secs);
+            if (ok) LOG("\n== 分数(blit) = %.2f GB/s ==\n", st.ops * st.bytes_per_op / 1e9 / score_den(&st));
         } else if (!strcmp(mode, "draw")) {
             VkPipeline pipe = NULL; VkPipelineLayout pl = NULL;
             if (!make_tri_pipeline(&c, t.rp, &pipe, &pl)) { LOG("X 管线创建失败\n"); goto out2; }
@@ -841,6 +2203,7 @@ out:
 // 一键全流程：冒烟 → 三角形校验 → 三种跑分 → 综合分
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeBenchAll(JNIEnv *env, jobject th, jstring jso, jint seconds) {
+    LOG("原生入口: nativeBenchAll 进入\n");
     (void) th; g_len = 0; g_log[0] = 0;
     const char *path = (*env)->GetStringUTFChars(env, jso, NULL);
     int secs = seconds > 0 ? seconds : 4;
@@ -901,6 +2264,7 @@ static unsigned char *g_rPixels;
 
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeRenderInit(JNIEnv *env, jobject th, jstring jso, jint w, jint h) {
+    LOG("原生入口: nativeRenderInit 进入\n");
     (void) th; g_len = 0; g_log[0] = 0; g_rinited = 0; g_rPixels = NULL;
     const char *path = (*env)->GetStringUTFChars(env, jso, NULL);
     g_rW = w > 0 ? (uint32_t) w : 512;
@@ -919,6 +2283,7 @@ out:
 
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeRenderFrame(JNIEnv *env, jobject th, jint frame) {
+    LOG("原生入口: nativeRenderFrame 进入\n");
     (void) env; (void) th; g_len = 0; g_log[0] = 0;
     if (!g_rinited) { LOG("X 未初始化\n"); return finish(env, NULL, NULL); }
     PFN_vkBeginCommandBuffer begin = (PFN_vkBeginCommandBuffer) g_rc.gdpa(g_rc.dev, "vkBeginCommandBuffer");
@@ -952,6 +2317,7 @@ Java_com_dsh_gputest_MainActivity_nativeRenderFrame(JNIEnv *env, jobject th, jin
 // 把渲染目标拷回主机并写进 Java 的 Bitmap（零额外拷贝：AndroidBitmap_lockPixels）
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeRenderBlit(JNIEnv *env, jobject th, jobject bmp) {
+    LOG("原生入口: nativeRenderBlit 进入\n");
     (void) th; g_len = 0; g_log[0] = 0;
     if (!g_rinited) { LOG("X 未初始化\n"); return finish(env, NULL, NULL); }
     void *px = NULL;
@@ -980,6 +2346,7 @@ Java_com_dsh_gputest_MainActivity_nativeRenderBlit(JNIEnv *env, jobject th, jobj
 
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeRenderStats(JNIEnv *env, jobject th) {
+    LOG("原生入口: nativeRenderStats 进入\n");
     (void) th; g_len = 0; g_log[0] = 0;
     double wall = (now_ms() - g_rT0) / 1000.0;
     if (!g_rinited) { LOG("未初始化\n"); return finish(env, NULL, NULL); }
@@ -991,6 +2358,7 @@ Java_com_dsh_gputest_MainActivity_nativeRenderStats(JNIEnv *env, jobject th) {
 
 JNIEXPORT void JNICALL
 Java_com_dsh_gputest_MainActivity_nativeRenderStop(JNIEnv *env, jobject th) {
+    LOG("原生入口: nativeRenderStop 进入\n");
     (void) env; (void) th;
     g_rinited = 0; g_rPixels = NULL;
 }
@@ -998,6 +2366,7 @@ Java_com_dsh_gputest_MainActivity_nativeRenderStop(JNIEnv *env, jobject th) {
 // ---- 能力清单（学 Vulkan Hardware Capability Viewer 的思路）----
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeCaps(JNIEnv *env, jobject th, jstring jso) {
+    LOG("原生入口: nativeCaps 进入\n");
     (void) th; g_len = 0; g_log[0] = 0;
     const char *path = (*env)->GetStringUTFChars(env, jso, NULL);
     LOG("=== 驱动能力清单 ===\n驱动: %s\n", path);
@@ -1118,6 +2487,7 @@ static const char *elf_classify(const void *base, size_t size, const char **why)
 
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeClassify(JNIEnv *env, jobject th, jstring jso) {
+    LOG("原生入口: nativeClassify 进入\n");
     (void) th;
     const char *p = jso ? (*env)->GetStringUTFChars(env, jso, NULL) : NULL;
     char out[192];
@@ -1151,15 +2521,91 @@ Java_com_dsh_gputest_MainActivity_nativeClassify(JNIEnv *env, jobject th, jstrin
 
 // ---------------------------------------------------------------- 崩溃自捕获
 // native 崩了没法 catch，但可以装信号处理器把现场写进文件 —— 下次闪退就有据可查。
+struct bt_ctx { void **pcs; int n, max; };
+static _Unwind_Reason_Code bt_cb(struct _Unwind_Context *ctx, void *arg) {
+    struct bt_ctx *b = (struct bt_ctx *) arg;
+    if (b->n >= b->max) return _URC_END_OF_STACK;
+    uintptr_t pc = (uintptr_t) _Unwind_GetIP(ctx);
+    if (pc) b->pcs[b->n++] = (void *) pc;
+    return _URC_NO_REASON;
+}
+/* v9.2：崩溃时**自带栈回溯**（函数名 + 库名）⇒ 不依赖 logcat/Shizuku ✓ */
+/* ★ v9.6 崩溃现场增强：原先 (void) uc; 把 ucontext 丢了，只记 _Unwind 的返回地址
+ *    （已知出过假帧——unwinder 在无帧信息的驱动代码里走飞）。真凭据 = ucontext 里的 PC ✓ */
+static char g_altstk[64 * 1024] __attribute__((aligned(16)));  /* 信号备用栈：显式大小，不用 SIGSTKSZ（bionic 上受限 ✗）*/
+static volatile sig_atomic_t g_in_crash = 0;                   /* 递归保护：处理器内再崩 ⇒ 直接退 ✓ */
+static const char *crash_basename(const char *p) {             /* 信号处理器内只做无分配操作 ✓ */
+    const char *q = p ? strrchr(p, '/') : NULL;
+    return q ? q + 1 : (p ? p : "?");
+}
 static void crash_handler(int sig, siginfo_t *si, void *uc) {
-    (void) uc;
-    char buf[256];
-    int n = snprintf(buf, sizeof(buf), "CRASH sig=%d addr=%p\n", sig, si ? si->si_addr : NULL);
+    if (g_in_crash) _exit(139);        /* 崩溃处理途中又崩：立即退，防自递归 ✓ */
+    g_in_crash = 1;
+    char buf[4096];
+    int n = 0;
+    n += snprintf(buf + n, sizeof(buf) - n, "CRASH sig=%d code=%d addr=%p\n",
+                  sig, si ? si->si_code : 0, si ? si->si_addr : NULL);
+#if defined(__aarch64__)
+    /* ★ 真现场：出错指令 PC + 栈指针 SP + 返回地址 LR + 帧指针 FP + fault_address ✓
+     *   bionic arm64: mcontext_t == struct sigcontext { fault_address; regs[31]; sp; pc; pstate; }
+     *   regs[30]=LR(X30)，regs[29]=FP(X29)——字段名已对照 NDK r27c sysroot 头文件 ✓ */
+    ucontext_t *u = (ucontext_t *) uc;
+    if (u) {
+        uintptr_t pc = (uintptr_t) u->uc_mcontext.pc;
+        uintptr_t sp = (uintptr_t) u->uc_mcontext.sp;
+        uintptr_t lr = (uintptr_t) u->uc_mcontext.regs[30];
+        uintptr_t fp = (uintptr_t) u->uc_mcontext.regs[29];
+        n += snprintf(buf + n, sizeof(buf) - n, "FAULT=0x%llx\n",
+                      (unsigned long long) u->uc_mcontext.fault_address);
+        Dl_info pdi;
+        if (pc && dladdr((void *) pc, &pdi) && pdi.dli_sname)
+            n += snprintf(buf + n, sizeof(buf) - n, "PC=0x%llx <%s+0x%lx> (%s)\n",
+                          (unsigned long long) pc, pdi.dli_sname,
+                          (unsigned long) ((char *) pc - (char *) pdi.dli_fbase),
+                          pdi.dli_fname ? crash_basename(pdi.dli_fname) : "?");
+        else
+            n += snprintf(buf + n, sizeof(buf) - n, "PC=0x%llx <符号未知> (dladdr 未命中)\n",
+                          (unsigned long long) pc);
+        Dl_info ldi;
+        if (lr && dladdr((void *) lr, &ldi) && ldi.dli_sname)
+            n += snprintf(buf + n, sizeof(buf) - n, "SP=0x%llx LR=0x%llx <%s+0x%lx> (%s) FP=0x%llx\n",
+                          (unsigned long long) sp, (unsigned long long) lr, ldi.dli_sname,
+                          (unsigned long) ((char *) lr - (char *) ldi.dli_fbase),
+                          ldi.dli_fname ? crash_basename(ldi.dli_fname) : "?",
+                          (unsigned long long) fp);
+        else
+            n += snprintf(buf + n, sizeof(buf) - n, "SP=0x%llx LR=0x%llx FP=0x%llx\n",
+                          (unsigned long long) sp, (unsigned long long) lr, (unsigned long long) fp);
+    } else {
+        n += snprintf(buf + n, sizeof(buf) - n, "PC=不可用 (uc 为空)\n");
+    }
+#else
+    n += snprintf(buf + n, sizeof(buf) - n, "PC=不可用 (非 arm64 构建)\n");
+#endif
+    void *pcs[40];
+    struct bt_ctx b; b.pcs = pcs; b.n = 0; b.max = 40;
+    _Unwind_Backtrace(bt_cb, &b);
+    for (int i = 0; i < b.n && n < (int) sizeof(buf) - 160; i++) {
+        Dl_info di;
+        if (dladdr(pcs[i], &di) && di.dli_sname)
+            n += snprintf(buf + n, sizeof(buf) - n, "  #%02d %p %s  (%s+0x%lx)\n",
+                          i, pcs[i], di.dli_sname,
+                          di.dli_fname ? strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname : "?",
+                          (unsigned long) ((char *) pcs[i] - (char *) di.dli_fbase));
+        else
+            n += snprintf(buf + n, sizeof(buf) - n, "  #%02d %p ?\n", i, pcs[i]);
+    }
+    n += snprintf(buf + n, sizeof(buf) - n, "---- end ----\n");
     int fd = open("/data/local/tmp/gputest_crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0600);
-    if (fd < 0) fd = open("/storage/emulated/0/Download/gputest_crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0600);
-    if (fd >= 0) { write(fd, buf, n); close(fd); }
-    signal(sig, SIG_DFL);
-    raise(sig);
+    if (fd < 0) fd = open("/sdcard/Download/gputest_crash.txt", O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) { ssize_t w = write(fd, buf, n); (void) w; close(fd); }
+    /* ★ v9.6：写完现场后，三个信号全部恢复默认再 abort()（原先只 raise(sig) ✗）
+     * ① 先把 SIGABRT 也恢复 SIG_DFL ⇒ abort() 引发的 SIGABRT 不会再进本处理器（防自递归）✓
+     * ② 走 abort() 的系统路径 ⇒ tombstoned 也能吃到完整现场，双保险 ✓ */
+    signal(SIGSEGV, SIG_DFL);
+    signal(SIGABRT, SIG_DFL);
+    signal(SIGBUS, SIG_DFL);
+    abort();
 }
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
@@ -1167,7 +2613,17 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = crash_handler;
-    sa.sa_flags = SA_SIGINFO;
+    /* ★ v9.6：SA_ONSTACK + sigaltstack —— 处理器在 64KiB 备用栈上跑，
+     *   栈耗尽型 SIGSEGV（原栈已不可写）也能照常记录现场 ✓ */
+    {
+        stack_t ss;
+        memset(&ss, 0, sizeof(ss));
+        ss.ss_sp = g_altstk;
+        ss.ss_size = sizeof(g_altstk);
+        ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+    }
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
@@ -1402,6 +2858,7 @@ static Ctx g_st_ctx; static int g_st_ctx_ok = 0;   /* v5.1: 常驻上下文 —�
 
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeStressInit(JNIEnv *env, jobject th, jstring jso, jint w, jint h) {
+    LOG("原生入口: nativeStressInit 进入\n");
     (void) th;
     const char *so = jso ? (*env)->GetStringUTFChars(env, jso, NULL) : NULL;
     char out[256];
@@ -1438,6 +2895,7 @@ static double stress_coverage(int tris) {
 
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeStressFrame(JNIEnv *env, jobject th, jint triCount) {
+    LOG("原生入口: nativeStressFrame 进入\n");
     (void) th;
     char out[384];
     if (!g_st_ready || !g_st_ctx_ok) return (*env)->NewStringUTF(env, "压力场景未初始化");
@@ -1492,6 +2950,7 @@ Java_com_dsh_gputest_MainActivity_nativeStressFrame(JNIEnv *env, jobject th, jin
 
 JNIEXPORT jstring JNICALL
 Java_com_dsh_gputest_MainActivity_nativeStressBlit(JNIEnv *env, jobject th, jobject bmp) {
+    LOG("原生入口: nativeStressBlit 进入\n");
     (void) th;
     if (!g_st_ready || !g_st_ctx_ok || !g_st_tgt.img) return (*env)->NewStringUTF(env, "压力场景无图像");
     AndroidBitmapInfo info;
@@ -1515,24 +2974,26 @@ Java_com_dsh_gputest_MainActivity_nativeStressBlit(JNIEnv *env, jobject th, jobj
     return (*env)->NewStringUTF(env, "已拷入位图");
 }
 
-JNIEXPORT jstring JNICALL
+JNIEXPORT void JNICALL
 Java_com_dsh_gputest_MainActivity_nativeStressStop(JNIEnv *env, jobject th) {
+    LOG("原生入口: nativeStressStop 进入\n");
     (void) th;
     if (g_st_ctx_ok) { ctx_close(&g_st_ctx); g_st_ctx_ok = 0; }
     g_st_ready = 0;
-    return (*env)->NewStringUTF(env, "压力场景已释放");
+    /* 返回类型已改为 void（与 Java 声明一致 ✓）*/
 }
 
 /* glm 要的名字（与 nativeStressClear 同义）*/
-JNIEXPORT jstring JNICALL
+JNIEXPORT void JNICALL
 Java_com_dsh_gputest_MainActivity_nativeStressClearColor(JNIEnv *env, jobject th, jint r, jint g, jint b) {
+    LOG("原生入口: nativeStressClearColor 进入\n");
     (void) th;
     g_st_clear[0] = (float) (r & 0xFF) / 255.0f;
     g_st_clear[1] = (float) (g & 0xFF) / 255.0f;
     g_st_clear[2] = (float) (b & 0xFF) / 255.0f;
     char out[96];
     snprintf(out, sizeof(out), "清屏色已设为 R=%d G=%d B=%d", r & 0xFF, g & 0xFF, b & 0xFF);
-    return (*env)->NewStringUTF(env, out);
+    /* 返回类型已改为 void（与 Java 声明一致 ✓）*/
 }
 
 JNIEXPORT jstring JNICALL
@@ -1544,4 +3005,412 @@ Java_com_dsh_gputest_MainActivity_nativeStressClear(JNIEnv *env, jobject th, jin
     char out[96];
     snprintf(out, sizeof(out), "清屏色已设为 R=%d G=%d B=%d", r & 0xFF, g & 0xFF, b & 0xFF);
     return (*env)->NewStringUTF(env, out);
+}
+
+// ============================================================================
+//  v7.0 · 光影（多 pass 光照）设置 —— 开关表 + 状态存储
+//  用途：① 把光影负载跑起来 ② 开关可调（用户要求"可以控制一些开关"）
+//  这些开关**必须真的影响渲染**（不然就是摆设 ✗）：见 litApply()
+// ============================================================================
+/* （LitCfg 已上移到光追代码之前，见下方）*/
+
+
+static const char *lit_summary(char *buf, size_t n) {
+    snprintf(buf, n,
+        "光影设置：阴影=%s PCF=%dx%d 阴影图=%d 立方体=%d 泛光=%s 色调映射=%s 负载倍率=%d 视图=%s 动画=%s",
+        g_lit.shadows ? "开" : "关", g_lit.pcfTaps, g_lit.pcfTaps, g_lit.shadowRes, g_lit.cubes,
+        g_lit.bloom ? "开" : "关", g_lit.tonemap ? "开" : "关", g_lit.passesPerFrame,
+        g_lit.debugView == 0 ? "最终" : (g_lit.debugView == 1 ? "阴影图" : "法线"),
+        g_lit.animate ? "开" : "关");
+    return buf;
+}
+
+/* 键名 → 取值（Java 侧用字符串键，避免两边常量号对不上 ✓）*/
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeLitConfig(JNIEnv *env, jobject th, jstring jkey, jint jval) {
+    LOG("光影入口: nativeLitConfig 进入\n");
+    (void) th;
+    const char *k = jkey ? (*env)->GetStringUTFChars(env, jkey, NULL) : NULL;
+    char out[256];
+    if (k) {
+        if (!strcmp(k, "shadows"))        g_lit.shadows = jval ? 1 : 0;
+        else if (!strcmp(k, "pcf"))       g_lit.pcfTaps = (jval < 1) ? 1 : (jval > 5 ? 5 : jval);
+        else if (!strcmp(k, "shadowRes")) g_lit.shadowRes = (jval < 512) ? 512 : (jval > 4096 ? 4096 : jval);
+        else if (!strcmp(k, "cubes"))     g_lit.cubes = (jval < 1) ? 1 : (jval > 1024 ? 1024 : jval);
+        else if (!strcmp(k, "bloom"))     g_lit.bloom = jval ? 1 : 0;
+        else if (!strcmp(k, "tonemap"))   g_lit.tonemap = jval ? 1 : 0;
+        else if (!strcmp(k, "passes"))    g_lit.passesPerFrame = (jval < 1) ? 1 : (jval > 64 ? 64 : jval);
+        else if (!strcmp(k, "debugView")) g_lit.debugView = jval;
+        else if (!strcmp(k, "animate"))   g_lit.animate = jval ? 1 : 0;
+        (*env)->ReleaseStringUTFChars(env, jkey, k);
+    }
+    lit_summary(out, sizeof(out));
+    return (*env)->NewStringUTF(env, out);
+}
+
+/* 一次性读取全部设置（面板初始化用 ✓）*/
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeLitSettings(JNIEnv *env, jobject th) {
+    LOG("光影入口: nativeLitSettings 进入\n");
+    (void) th;
+    char out[320];
+    snprintf(out, sizeof(out), "%d,%d,%d,%d,%d,%d,%d,%d,%d",
+        g_lit.shadows, g_lit.pcfTaps, g_lit.shadowRes, g_lit.cubes,
+        g_lit.bloom, g_lit.tonemap, g_lit.passesPerFrame, g_lit.debugView, g_lit.animate);
+    return (*env)->NewStringUTF(env, out);
+}
+
+// ============================================================================
+//  v7.0 · 光追（Ray Tracing）能力探测
+//  诚实原则：**能开就真开，不能开就明说** ✗ 绝不用"软件假装"糊弄 ✓
+//  判据：VK_KHR_acceleration_structure（必需）/ ray_query / ray_tracing_pipeline / deferred_host_operations
+// ============================================================================
+static int has_ext(const char *list, const char *want) {
+    if (!list || !want) return 0;
+    size_t n = strlen(want);
+    const char *p = list;
+    while ((p = strstr(p, want)) != NULL) {
+        char c = p[n];
+        if (c == '\0' || c == ' ') return 1;      /* 完整词匹配（防 VK_KHR_ray_query_foo）*/
+        p += n;
+    }
+    return 0;
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_dsh_gputest_MainActivity_nativeRtProbe(JNIEnv *env, jobject th, jstring jso) {
+    LOG("原生入口: nativeRtProbe 进入\n");
+    (void) th;
+    const char *path = jso ? (*env)->GetStringUTFChars(env, jso, NULL) : NULL;
+    char out[1024];
+    Ctx c;
+    if (!ctx_open(&c, path ? path : "system")) {
+        if (path) (*env)->ReleaseStringUTFChars(env, jso, path);
+        return (*env)->NewStringUTF(env, "光追探测：驱动不可用（先修驱动再谈光追）");
+    }
+    if (path) (*env)->ReleaseStringUTFChars(env, jso, path);
+    /* 实例扩展 */
+    PFN_vkEnumerateInstanceExtensionProperties eie =
+        (PFN_vkEnumerateInstanceExtensionProperties) c_gipa(&c, "vkEnumerateInstanceExtensionProperties");
+    char ext[8192]; ext[0] = '\0';
+    uint32_t n = 0;
+    if (eie && eie(NULL, &n, NULL) == VK_SUCCESS && n > 0 && n < 400) {
+        VkExtensionProperties *ep = (VkExtensionProperties *) malloc(sizeof(VkExtensionProperties) * n);
+        if (ep && eie(NULL, &n, ep) == VK_SUCCESS)
+            for (uint32_t i = 0; i < n; i++) {
+                strncat(ext, ep[i].extensionName, sizeof(ext) - strlen(ext) - 2);
+                strncat(ext, " ", sizeof(ext) - strlen(ext) - 2);
+            }
+        free(ep);
+    }
+    /* 设备扩展 */
+    PFN_vkEnumerateDeviceExtensionProperties ede =
+        (PFN_vkEnumerateDeviceExtensionProperties) c_gipa(&c, "vkEnumerateDeviceExtensionProperties");
+    n = 0;
+    if (ede && c.pd && ede(c.pd, NULL, &n, NULL) == VK_SUCCESS && n > 0 && n < 400) {
+        VkExtensionProperties *ep = (VkExtensionProperties *) malloc(sizeof(VkExtensionProperties) * n);
+        if (ep && ede(c.pd, NULL, &n, ep) == VK_SUCCESS)
+            for (uint32_t i = 0; i < n; i++) {
+                strncat(ext, ep[i].extensionName, sizeof(ext) - strlen(ext) - 2);
+                strncat(ext, " ", sizeof(ext) - strlen(ext) - 2);
+            }
+        free(ep);
+    }
+    int as = has_ext(ext, "VK_KHR_acceleration_structure");
+    int rq = has_ext(ext, "VK_KHR_ray_query");
+    int rp = has_ext(ext, "VK_KHR_ray_tracing_pipeline");
+    int dh = has_ext(ext, "VK_KHR_deferred_host_operations");
+    snprintf(out, sizeof(out),
+        "【光追能力探测】\n"
+        "  VK_KHR_acceleration_structure = %s（加速结构，**必需**）\n"
+        "  VK_KHR_ray_query             = %s（光线查询）\n"
+        "  VK_KHR_ray_tracing_pipeline  = %s（光追管线）\n"
+        "  VK_KHR_deferred_host_operations = %s（异步构建）\n"
+        "  ⇒ 判定：%s",
+        as ? "有 ✓" : "无 ✗", rq ? "有 ✓" : "无 ✗", rp ? "有 ✓" : "无 ✗", dh ? "有 ✓" : "无 ✗",
+        (as && (rq || rp)) ? "该驱动**支持硬件光追** ⇒ 可开真实光追 ✓"
+                           : "该驱动**不支持硬件光追** ✗（PanVK/Mesa 现状如此）⇒ 开关将改用「CPU 光追参考图」，并明确标注 ✗ 不假装 ✓");
+    ctx_close(&c);
+    return (*env)->NewStringUTF(env, out);
+}
+
+// ============================================================================
+//  v9.11 · 迷你 3D —— 独立最简 GPU 场景（自转立方体）
+//  刻意**不复用**光影/光追的任何状态：自己的上下文、颜色图、深度图、渲染通道、
+//  管线、命令池、栅栏、回读缓冲。设计上逐条避开今天踩过的坑：
+//    ① 命令池带 RESET_COMMAND_BUFFER_BIT，且**每帧先 vkResetCommandBuffer 再 begin**（双保险）
+//    ② 全部使用头文件里的 PFN_vk* 原型（绝不手写 typedef ⇒ 杜绝 ABI 错位）
+//    ③ 回读前补一道**带 srcAccessMask/dstAccessMask** 的屏障（审查报告 B1 的正确写法）
+//    ④ 回读缓冲走 mk_buf(host=1)：拿不到 HOST_VISIBLE 就硬失败，绝不退化
+//    ⑤ 映射失败 / 提交失败都会**明确写进返回行**（不再静默）
+//  返回行还带像素统计（min/max/均）⇒ 一眼分辨「GPU 没写」还是「写进去是黑的」
+// ============================================================================
+typedef struct { float mvp[16]; float t; float _pad[3]; int set[8]; } MiniPC;   /* v9.28: + 设置数组，80->112 字节（<=128 push constant 上限）*/   /* 80 字节，按 16 对齐 ✓ */
+
+typedef struct {
+    int ok, w, h;
+    Ctx ctx;
+    VkImage img;      VkDeviceMemory imgMem;  VkImageView view;
+    VkImage dimg;     VkDeviceMemory dMem;    VkImageView dview;
+    VkRenderPass rp;  VkFramebuffer fb;
+    VkPipelineLayout pl; VkPipeline pipe;
+    VkShaderModule vs, fs;
+    VkCommandPool cpool; VkCommandBuffer cb; VkFence fence;
+    VkBuffer rbuf;    VkDeviceMemory rMem;
+    float mvp[16];
+    double t0;
+} Mini3D;
+static Mini3D g_m3d;
+static int g_m3set[8] = { 1, 3, 2048, 1, 1, 1, 1, 36 };   /* v9.28: 阴影/PCF/阴影图/泛光/色调映射/动画/负载/物体数 */
+
+static void mini3d_destroy(void) {
+    if (g_m3d.ctx.dev) {
+        PFN_vkDeviceWaitIdle wid = (PFN_vkDeviceWaitIdle) g_m3d.ctx.gdpa(g_m3d.ctx.dev, "vkDeviceWaitIdle");
+        if (wid) wid(g_m3d.ctx.dev);
+        ctx_close(&g_m3d.ctx);          /* 设备一关，其下所有对象由驱动回收 ✓ */
+    }
+    memset(&g_m3d, 0, sizeof(g_m3d));
+}
+
+JNIEXPORT jint JNICALL Java_com_dsh_gputest_MainActivity_nativeMini3DInit(JNIEnv *env, jobject th, jstring jso, jint w, jint h) {
+    (void) th;
+    if (g_m3d.ok) return 1;
+    const char *so = jso ? (*env)->GetStringUTFChars(env, jso, NULL) : NULL;
+    Ctx *c = &g_m3d.ctx;
+    LOG("── mini3d init %dx%d · so=%s ──\n", (int) w, (int) h, so ? so : "system");
+    int opened = ctx_open(c, so ? so : "system");
+    if (so) (*env)->ReleaseStringUTFChars(env, jso, so);
+    if (!opened) { LOG("X mini3d: ctx_open 失败\n"); memset(&g_m3d, 0, sizeof(g_m3d)); return 0; }
+    g_m3d.w = (int) w; g_m3d.h = (int) h;
+
+    /* ① 颜色图：COLOR_ATTACHMENT | TRANSFER_SRC（回读必需 ✓） */
+    if (!mk_img(c, (int) w, (int) h, VK_FORMAT_R8G8B8A8_UNORM,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &g_m3d.img, &g_m3d.imgMem)) {
+        LOG("X mini3d: 颜色图失败\n"); mini3d_destroy(); return 0; }
+    g_m3d.view = mk_view(c, g_m3d.img, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT);
+    /* ② 深度图：有深度就不必纠结三角形绕序 ✓ */
+    if (!mk_img(c, (int) w, (int) h, VK_FORMAT_D32_SFLOAT,
+                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, &g_m3d.dimg, &g_m3d.dMem)) {
+        LOG("X mini3d: 深度图失败\n"); mini3d_destroy(); return 0; }
+    g_m3d.dview = mk_view(c, g_m3d.dimg, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
+    if (!g_m3d.view || !g_m3d.dview) { LOG("X mini3d: 视图失败\n"); mini3d_destroy(); return 0; }
+
+    /* ③ 渲染通道：颜色 finalLayout = TRANSFER_SRC_OPTIMAL ⇒ 回读时布局已就位 ✓ */
+    PFN_vkCreateRenderPass crp = (PFN_vkCreateRenderPass) c->gdpa(c->dev, "vkCreateRenderPass");
+    if (!crp) { mini3d_destroy(); return 0; }
+    VkAttachmentDescription at[2]; memset(at, 0, sizeof(at));
+    at[0].format = VK_FORMAT_R8G8B8A8_UNORM;  at[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    at[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    at[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    at[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    at[1].format = VK_FORMAT_D32_SFLOAT;      at[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    at[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; at[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    at[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; at[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    at[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED; at[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkAttachmentReference cr = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference dr = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    VkSubpassDescription sp; memset(&sp, 0, sizeof(sp));
+    sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sp.colorAttachmentCount = 1; sp.pColorAttachments = &cr; sp.pDepthStencilAttachment = &dr;
+    VkSubpassDependency dep; memset(&dep, 0, sizeof(dep));
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL; dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.srcAccessMask = 0;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    VkRenderPassCreateInfo rci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        .attachmentCount = 2, .pAttachments = at, .subpassCount = 1, .pSubpasses = &sp,
+        .dependencyCount = 1, .pDependencies = &dep };
+    if (crp(c->dev, &rci, NULL, &g_m3d.rp) != VK_SUCCESS) { LOG("X mini3d: render pass 失败\n"); mini3d_destroy(); return 0; }
+
+    /* ④ framebuffer */
+    VkImageView atts[2] = { g_m3d.view, g_m3d.dview };
+    PFN_vkCreateFramebuffer cfb = (PFN_vkCreateFramebuffer) c->gdpa(c->dev, "vkCreateFramebuffer");
+    VkFramebufferCreateInfo fbci = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = g_m3d.rp,
+        .attachmentCount = 2, .pAttachments = atts, .width = (uint32_t) w, .height = (uint32_t) h, .layers = 1 };
+    if (!cfb || cfb(c->dev, &fbci, NULL, &g_m3d.fb) != VK_SUCCESS) { LOG("X mini3d: framebuffer 失败\n"); mini3d_destroy(); return 0; }
+
+    /* ⑤ 着色器模块（SPIR-V 来自 shaders_mini3d.h） */
+    PFN_vkCreateShaderModule csm = (PFN_vkCreateShaderModule) c->gdpa(c->dev, "vkCreateShaderModule");
+    if (!csm) { mini3d_destroy(); return 0; }
+    VkShaderModuleCreateInfo smi = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = mini3d_vert_spv_len * 4, .pCode = mini3d_vert_spv };
+    if (csm(c->dev, &smi, NULL, &g_m3d.vs) != VK_SUCCESS) { LOG("X mini3d: vs 模块失败\n"); mini3d_destroy(); return 0; }
+    smi.codeSize = mini3d_frag_spv_len * 4; smi.pCode = mini3d_frag_spv;
+    if (csm(c->dev, &smi, NULL, &g_m3d.fs) != VK_SUCCESS) { LOG("X mini3d: fs 模块失败\n"); mini3d_destroy(); return 0; }
+
+    /* ⑥ 管线布局：只有 push constant（无描述符 ⇒ 少一半出错面 ✓） */
+    PFN_vkCreatePipelineLayout cpl = (PFN_vkCreatePipelineLayout) c->gdpa(c->dev, "vkCreatePipelineLayout");
+    VkPushConstantRange pcr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(MiniPC) };   /* v9.14：片元也读 t ✓ */
+    VkPipelineLayoutCreateInfo plci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr };
+    if (!cpl || cpl(c->dev, &plci, NULL, &g_m3d.pl) != VK_SUCCESS) { LOG("X mini3d: 管线布局失败\n"); mini3d_destroy(); return 0; }
+
+    /* ⑦ 图形管线 */
+    VkPipelineShaderStageCreateInfo st[2]; memset(st, 0, sizeof(st));
+    st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = g_m3d.vs; st[0].pName = "main";
+    st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = g_m3d.fs; st[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vi; memset(&vi, 0, sizeof(vi)); vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    VkPipelineInputAssemblyStateCreateInfo ia; memset(&ia, 0, sizeof(ia));
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO; ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkViewport vp = { 0, 0, (float) w, (float) h, 0, 1 };
+    VkRect2D sc = { { 0, 0 }, { (uint32_t) w, (uint32_t) h } };
+    VkPipelineViewportStateCreateInfo vs; memset(&vs, 0, sizeof(vs));
+    vs.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vs.viewportCount = 1; vs.pViewports = &vp; vs.scissorCount = 1; vs.pScissors = &sc;
+    VkPipelineRasterizationStateCreateInfo rs; memset(&rs, 0, sizeof(rs));
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms; memset(&ms, 0, sizeof(ms));
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO; ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dss; memset(&dss, 0, sizeof(dss));
+    dss.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    dss.depthTestEnable = VK_TRUE; dss.depthWriteEnable = VK_TRUE; dss.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    VkPipelineColorBlendAttachmentState cba; memset(&cba, 0, sizeof(cba));
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cbs; memset(&cbs, 0, sizeof(cbs));
+    cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cbs.attachmentCount = 1; cbs.pAttachments = &cba;
+    VkGraphicsPipelineCreateInfo gp; memset(&gp, 0, sizeof(gp));
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.stageCount = 2; gp.pStages = st;
+    gp.pVertexInputState = &vi; gp.pInputAssemblyState = &ia; gp.pViewportState = &vs;
+    gp.pRasterizationState = &rs; gp.pMultisampleState = &ms; gp.pDepthStencilState = &dss;
+    gp.pColorBlendState = &cbs; gp.layout = g_m3d.pl; gp.renderPass = g_m3d.rp; gp.subpass = 0;
+    PFN_vkCreateGraphicsPipelines cgp = (PFN_vkCreateGraphicsPipelines) c->gdpa(c->dev, "vkCreateGraphicsPipelines");
+    if (!cgp || cgp(c->dev, VK_NULL_HANDLE, 1, &gp, NULL, &g_m3d.pipe) != VK_SUCCESS) {
+        LOG("X mini3d: 管线创建失败\n"); mini3d_destroy(); return 0; }
+
+    /* ⑧ 命令池（★ 带 RESET 标志）+ 命令缓冲 + 栅栏 */
+    PFN_vkCreateCommandPool ccp = (PFN_vkCreateCommandPool) c->gdpa(c->dev, "vkCreateCommandPool");
+    PFN_vkAllocateCommandBuffers acb = (PFN_vkAllocateCommandBuffers) c->gdpa(c->dev, "vkAllocateCommandBuffers");
+    PFN_vkCreateFence cf = (PFN_vkCreateFence) c->gdpa(c->dev, "vkCreateFence");
+    VkCommandPoolCreateInfo cpci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = c->qfam };
+    if (!ccp || !acb || !cf || ccp(c->dev, &cpci, NULL, &g_m3d.cpool) != VK_SUCCESS) { LOG("X mini3d: 命令池失败\n"); mini3d_destroy(); return 0; }
+    VkCommandBufferAllocateInfo cbai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = g_m3d.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+    if (acb(c->dev, &cbai, &g_m3d.cb) != VK_SUCCESS) { LOG("X mini3d: 命令缓冲失败\n"); mini3d_destroy(); return 0; }
+    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    if (cf(c->dev, &fci, NULL, &g_m3d.fence) != VK_SUCCESS) { LOG("X mini3d: 栅栏失败\n"); mini3d_destroy(); return 0; }
+
+    /* ⑨ 回读缓冲（host=1 ⇒ 严格要 HOST_VISIBLE，拿不到就硬失败 ✓） */
+    if (!mk_buf(c, (VkDeviceSize) w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g_m3d.rbuf, &g_m3d.rMem, 1)) {
+        LOG("X mini3d: 回读缓冲失败\n"); mini3d_destroy(); return 0; }
+
+    /* ⑩ 固定相机 MVP（自转在顶点着色器里做 ⇒ 这里只算一次 ✓） */
+    float eye[3] = { 3.4f, 2.2f, 3.4f }, tgt[3] = { 0.0f, 0.0f, 0.0f };
+    lit_mvp(g_m3d.mvp, (float) w / (float) (h > 0 ? (int) h : 1), eye, tgt, 0.95f);
+    g_m3d.t0 = now_ms();
+    g_m3d.ok = 1;
+    LOG("mini3d: 就绪 ✓ %dx%d（颜色 R8G8B8A8 + 深度 D32，独立管线/命令池）\n", (int) w, (int) h);
+    return 1;
+}
+
+JNIEXPORT void JNICALL Java_com_dsh_gputest_MainActivity_nativeMini3DSettings(JNIEnv *env, jobject th, jint shadows, jint pcf, jint res, jint bloom, jint tonemap, jint animate, jint passes) {
+    (void) env; (void) th;
+    g_m3set[0] = shadows; g_m3set[1] = pcf; g_m3set[2] = res; g_m3set[3] = bloom;
+    g_m3set[4] = tonemap; g_m3set[5] = animate; g_m3set[6] = (passes < 1) ? 1 : passes;
+    LOG("  mini3D 设置 -> shadows=%d pcf=%d res=%d bloom=%d tonemap=%d anim=%d load=%d",
+        shadows, pcf, res, bloom, tonemap, animate, passes);
+}
+
+JNIEXPORT jstring JNICALL Java_com_dsh_gputest_MainActivity_nativeMini3DFrame(JNIEnv *env, jobject th, jobject bmp) {
+    (void) th;
+    char out[420];
+    if (!g_m3d.ok) return (*env)->NewStringUTF(env, "X mini3d 未初始化");
+    Ctx *c = &g_m3d.ctx;
+    PFN_vkResetCommandBuffer  rcb = (PFN_vkResetCommandBuffer)  c->gdpa(c->dev, "vkResetCommandBuffer");
+    PFN_vkBeginCommandBuffer  bcb = (PFN_vkBeginCommandBuffer)  c->gdpa(c->dev, "vkBeginCommandBuffer");
+    PFN_vkEndCommandBuffer    ecb = (PFN_vkEndCommandBuffer)    c->gdpa(c->dev, "vkEndCommandBuffer");
+    PFN_vkCmdBeginRenderPass  brp = (PFN_vkCmdBeginRenderPass)  c->gdpa(c->dev, "vkCmdBeginRenderPass");
+    PFN_vkCmdEndRenderPass    erp = (PFN_vkCmdEndRenderPass)    c->gdpa(c->dev, "vkCmdEndRenderPass");
+    PFN_vkCmdBindPipeline     bp  = (PFN_vkCmdBindPipeline)     c->gdpa(c->dev, "vkCmdBindPipeline");
+    PFN_vkCmdPushConstants    pc_ = (PFN_vkCmdPushConstants)    c->gdpa(c->dev, "vkCmdPushConstants");
+    PFN_vkCmdDraw             dr  = (PFN_vkCmdDraw)             c->gdpa(c->dev, "vkCmdDraw");
+    PFN_vkCmdPipelineBarrier  bar = (PFN_vkCmdPipelineBarrier)  c->gdpa(c->dev, "vkCmdPipelineBarrier");
+    PFN_vkCmdCopyImageToBuffer c2b = (PFN_vkCmdCopyImageToBuffer) c->gdpa(c->dev, "vkCmdCopyImageToBuffer");
+    PFN_vkResetFences         rf  = (PFN_vkResetFences)         c->gdpa(c->dev, "vkResetFences");
+    PFN_vkQueueSubmit         qs  = (PFN_vkQueueSubmit)         c->gdpa(c->dev, "vkQueueSubmit");
+    PFN_vkWaitForFences       wf  = (PFN_vkWaitForFences)       c->gdpa(c->dev, "vkWaitForFences");
+    if (!rcb||!bcb||!ecb||!brp||!erp||!bp||!pc_||!dr||!bar||!c2b||!rf||!qs||!wf)
+        return (*env)->NewStringUTF(env, "X mini3d 命令入口缺失");
+
+    rcb(g_m3d.cb, 0);                                   /* ★ 先 reset 再 begin（池也带 RESET 标志 ✓） */
+    VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+    VkResult r = bcb(g_m3d.cb, &bi);
+    if (r != VK_SUCCESS) { snprintf(out, sizeof(out), "X mini3d begin 失败 r=%d", r); return (*env)->NewStringUTF(env, out); }
+
+    VkClearValue cv[2]; memset(cv, 0, sizeof(cv));
+    cv[0].color.float32[0] = 0.05f; cv[0].color.float32[1] = 0.06f; cv[0].color.float32[2] = 0.09f; cv[0].color.float32[3] = 1.0f;
+    cv[1].depthStencil.depth = 1.0f;
+    VkRenderPassBeginInfo rb = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = g_m3d.rp, .framebuffer = g_m3d.fb,
+        .renderArea = { { 0, 0 }, { (uint32_t) g_m3d.w, (uint32_t) g_m3d.h } },
+        .clearValueCount = 2, .pClearValues = cv };
+    brp(g_m3d.cb, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    bp(g_m3d.cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_m3d.pipe);
+    MiniPC pcv; memset(&pcv, 0, sizeof(pcv));
+    memcpy(pcv.mvp, g_m3d.mvp, sizeof(pcv.mvp));
+    memcpy(pcv.set, g_m3set, sizeof(pcv.set));   /* v9.28 */
+    pcv.t = (float) ((now_ms() - g_m3d.t0) / 1000.0);
+    pc_(g_m3d.cb, g_m3d.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pcv), &pcv);   /* v9.14 */
+    dr(g_m3d.cb, 3, 1, 0, 0);   /* v9.14：全屏三角形，3D 在片元里解析求交 ✓ */
+    erp(g_m3d.cb);
+
+    /* ★ 回读前的屏障：带 src/dst accessMask（B1 的正确写法，光影那条路径当年正是缺这个） */
+    VkImageMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .image = g_m3d.img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    bar(g_m3d.cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    VkBufferImageCopy bc = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { (uint32_t) g_m3d.w, (uint32_t) g_m3d.h, 1 } };
+    c2b(g_m3d.cb, g_m3d.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_m3d.rbuf, 1, &bc);
+
+    VkResult r2 = ecb(g_m3d.cb);
+    if (r2 != VK_SUCCESS) { snprintf(out, sizeof(out), "X mini3d end 失败 r=%d", r2); return (*env)->NewStringUTF(env, out); }
+    rf(c->dev, 1, &g_m3d.fence);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &g_m3d.cb };
+    r = qs(c->q, 1, &si, g_m3d.fence);
+    if (r == VK_SUCCESS) r = wf(c->dev, 1, &g_m3d.fence, VK_TRUE, 3000000000ULL);
+    if (r != VK_SUCCESS) {
+        snprintf(out, sizeof(out), "X mini3d 提交/等待失败 r=%d（%s）", r, r == -4 ? "VK_ERROR_DEVICE_LOST" : "见 VkResult 表");
+        return (*env)->NewStringUTF(env, out);
+    }
+
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bmp, &info) != ANDROID_BITMAP_RESULT_SUCCESS)
+        return (*env)->NewStringUTF(env, "X mini3d: 取位图信息失败");
+    void *pix = NULL;
+    if (AndroidBitmap_lockPixels(env, bmp, &pix) != ANDROID_BITMAP_RESULT_SUCCESS)
+        return (*env)->NewStringUTF(env, "X mini3d: 锁定位图失败");
+    PFN_vkMapMemory   mp = (PFN_vkMapMemory)   c->gdpa(c->dev, "vkMapMemory");
+    PFN_vkUnmapMemory um = (PFN_vkUnmapMemory) c->gdpa(c->dev, "vkUnmapMemory");
+    void *src = NULL;
+    int mapped = (mp && um && mp(c->dev, g_m3d.rMem, 0, VK_WHOLE_SIZE, 0, &src) == VK_SUCCESS && src);
+    double pmin = -1, pmax = -1, pavg = -1;
+    if (mapped) {
+        unsigned char *sb = (unsigned char *) src;
+        size_t tot = (size_t) g_m3d.w * g_m3d.h * 4, sum = 0, cnt = 0;
+        int mn = 255, mx = 0;
+        for (size_t i = 0; i < tot; i += 64) { int v = sb[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += (size_t) v; cnt++; }
+        if (cnt) { pmin = mn; pmax = mx; pavg = (double) sum / (double) cnt; }
+        int cw = g_m3d.w < (int) info.width  ? g_m3d.w : (int) info.width;
+        int chh = g_m3d.h < (int) info.height ? g_m3d.h : (int) info.height;
+        for (int y = 0; y < chh; y++)
+            memcpy((uint8_t *) pix + (size_t) y * info.stride, sb + (size_t) y * g_m3d.w * 4, (size_t) cw * 4);
+        um(c->dev, g_m3d.rMem);
+    }
+    AndroidBitmap_unlockPixels(env, bmp);
+    snprintf(out, sizeof(out), "%s 迷你3D ✓ 自转立方体 · 像素 min %.0f/max %.0f/均 %.1f · 位图 %dx%d stride %d",
+             mapped ? "已拷入位图" : "X 回读映射失败", pmin, pmax, pavg, (int) info.width, (int) info.height, (int) info.stride);
+    return (*env)->NewStringUTF(env, out);
+}
+
+JNIEXPORT void JNICALL Java_com_dsh_gputest_MainActivity_nativeMini3DStop(JNIEnv *env, jobject th) {
+    (void) env; (void) th;
+    mini3d_destroy();
 }

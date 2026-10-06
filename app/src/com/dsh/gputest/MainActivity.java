@@ -82,10 +82,31 @@ public class MainActivity extends Activity {
     public native String nativeLastStep();   /* 看门狗：返回"当前卡在哪一步" */
     public native String nativeClassify(String soPath);  /* 真 dlopen+dlsym 分类：ICD / 垫片 / 渲染器 / 打不开 */
     /* v5.1 压力测试（原生尚未接入时这些调用会抛 UnsatisfiedLinkError ⇒ 本页只提示，不崩 ✓） */
-    public native String nativeStressInit(String soPath, int w, int h);
+    public native String nativeStressInit(String soPath, int w, int h);   /* v5.2：必须带驱动路径（3 参） */
+    public native void   nativeStressClearColor(int r, int g, int b);     /* v5.2 原生导出：jint,jint,jint */
     public native String nativeStressFrame(int triCount);
     public native String nativeStressBlit(Bitmap bmp);
     public native void   nativeStressStop();
+    /* v7.0 光影（多 pass 光照）：配置/摘要立即可用；Init/Frame/Blit/Stop 待原生接入 ⇒ 未接入降级不崩 ✓ */
+    public native String nativeLitConfig(String key, int value);   /* (jstring,jint) */
+    public native String nativeLitSettings();                      /* () */
+    public native String nativeLitInit(String soPath, int w, int h);/* (jstring,jint,jint) */
+    public native String nativeLitFrame();                          /* () */
+    public native int    nativeMini3DInit(String soPath, int w, int h);   /* v9.11 迷你 3D 独立路径 (jstring,jint,jint) */
+    public native String nativeMini3DFrame(Bitmap bmp);                   /* v9.11 (Landroid/graphics/Bitmap;)Ljava/lang/String; */
+    public native void   nativeMini3DStop();
+    public native void   nativeMini3DSettings(int shadows, int pcf, int res, int bloom, int tonemap, int animate, int passes);                              /* v9.11 ()V */
+    public native String nativeLitBlit(Bitmap bmp);                 /* (jobject) */
+    public native void   nativeLitStop();                           /* () */
+    /* v7.0 光追能力探测（原生已可用）。注意：**不声明**尚未导出的 RtInit/RtFrame
+     * ⇒ 避免 jni_check.py 因"Java 有声明、原生无导出"拒绝构建 ✗ */
+    public native String nativeRtProbe(String soPath);               /* (jstring) */
+    public native String nativeRtInit(String soPath, int w, int h);   /* (jstring,jint,jint) v7.0 已导出 ✓
+     * v7.4 已导出（参数个数必须一致，否则 jni_check.py 拦构建 ✓） */
+    public native String nativeRtFrame();                             /* () */
+    public native String nativeRtBlit(Bitmap bmp);                    /* (jobject) */
+    public native String nativeRtStop();                              /* () */
+    /* nativeCpuRtRender(int) / nativeCpuRtBlit(Bitmap) **仍不声明** ✗ ⇒ 等原生导出后再加 ✓ */
 
     /* ---------------- 配色 ---------------- */
     /* ============================ 主题系统 ============================
@@ -97,9 +118,14 @@ public class MainActivity extends Activity {
                              C_TAB_ON_BG = 11, C_TAB_OFF_BG = 12, C_TAB_ON_TX = 13,
                              C_BTN_BG = 14, C_LOG_BG = 15, C_LOG_TX = 16, C_RENDER_BG = 17;
 
+    /* 扩展令牌 x[]：0=卡片圆角 1=按钮圆角 2=对话框圆角 3=表面 alpha 4=渐变亮度差 5=高光边 alpha
+     * 现有三套用 DEFAULT_X（= 现状：12/12/16dp、不透明、无渐变无高光）⇒ 观感零变化 ✓ */
+    private static final int[] DEFAULT_X = { 12, 12, 16, 255, 0, 0 };
+
     private static final class Theme {
-        final String id, name; final int[] p;
-        Theme(String id, String name, int[] p) { this.id = id; this.name = name; this.p = p; }
+        final String id, name; final int[] p, x;
+        Theme(String id, String name, int[] p) { this(id, name, p, DEFAULT_X); }
+        Theme(String id, String name, int[] p, int[] x) { this.id = id; this.name = name; this.p = p; this.x = x; }
     }
 
     /* 三套主题：深色（默认）/ 浅色 / 高对比（户外看数字）。
@@ -120,21 +146,53 @@ public class MainActivity extends Activity {
             0xFF000000, 0xFF0A0A0A, 0xFF3A3A3A, 0xFFFFFFFF, 0xFFD0D0D0, 0xFF00E5FF,
             0xFF00FF66, 0xFFFF3B30, 0xFFFFD400, 0xFFD0D0D0,
             0xFF00E5FF, 0xFF141414, 0xFF000000, 0xFF101010, 0xFF000000, 0xFFFFFFFF, 0xFF000000 }),
+        /* ===== ColorOS（第四套，用户参考 ColorOS 17：低饱和柔和 + 以蓝为锚 + 半透磨砂 + 大圆角 + 凝光渐变）=====
+         * 三态色都是"压在半透白卡上 ≥4.5:1"的深色版 ✓（ok 取 #0E8A45 稳过 AA）*/
+        new Theme("coloros", "ColorOS", new int[]{
+            0xFFF3F6FA, 0xFFFFFFFF, 0xFFEAF0F7, 0xFFDCE4EE, 0xFF12161C, 0xFF5A6675,
+            0xFF1B6EF3, 0xFF0E8A45, 0xFFC77700, 0xFFD92D20, 0xFF5A6675,
+            0xFF1B6EF3, 0xFFE7EEF8, 0xFFFFFFFF, 0xFFEAF1FA, 0xFFFFFFFF, 0xFF12161C, 0xFF0A0F16 },
+            new int[]{ 20, 16, 24, 230, 8, 0x1F }),        /* 卡 20dp / 按钮 16 / 弹层 24 / 表面 90% / 渐变 +8 / 高光 12% */
+        /* ColorOS 深色变体：深蓝黑 + 半透 + 同一套大圆角与凝光 */
+        new Theme("coloros-dark", "ColorOS 深色", new int[]{
+            0xFF0A0F16, 0xFF121A24, 0xFF1A2432, 0xFF2A3644, 0xFFE9EFF7, 0xFF9AA8BA,
+            0xFF4C9AFF, 0xFF38D39F, 0xFFFFC24B, 0xFFFF6B6B, 0xFF9AA8BA,
+            0xFF4C9AFF, 0xFF16202C, 0xFF08111C, 0xFF18222F, 0xFF070C12, 0xFFDCE7F5, 0xFF05080D },
+            new int[]{ 20, 16, 24, 235, 10, 0x22 }),
     };
 
     private static final String PREFS = "gputest", PREF_THEME = "theme";   /* 持久化：SharedPreferences("gputest").getString("theme", "dark") */
     private static int themeIdx = 0;
     private static int[] CUR = THEMES[0].p.clone();
+    private static int[] CURX = THEMES[0].x.clone();
 
     private static int c(int key) {
         int i = key - 1;
         return (i >= 0 && i < CUR.length) ? CUR[i] : 0xFF888888;
     }
 
+    private static int x(int i) { return (i >= 0 && i < CURX.length) ? CURX[i] : 0; }
+    private static int withAlpha(int color, int a) { return (color & 0x00FFFFFF) | ((a & 0xFF) << 24); }
+    private static int lighten(int color, int d) {
+        int r = Math.min(255, ((color >> 16) & 0xFF) + d);
+        int g = Math.min(255, ((color >> 8) & 0xFF) + d);
+        int b = Math.min(255, (color & 0xFF) + d);
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+
     /* ---------------- 页签 ---------------- */
     private static final String[] TAB_NAMES = { "概览", "驱动", "测试", "画面", "跑分", "日志", "压力" };
     private static final int TAB_OVERVIEW = 0, TAB_DRIVER = 1, TAB_TEST = 2,
                              TAB_PICTURE = 3, TAB_BENCH = 4, TAB_LOG = 5, TAB_STRESS = 6;
+
+    /* v6.1：底部导航 4 个目的地（原 7 个页签降级为页内二级分段） */
+    private static final int DEST_OVERVIEW = 0, DEST_TEST = 1, DEST_RENDER = 2, DEST_RECORDS = 3, DEST_SETTINGS = 4;   /* v9.57 */
+    private static final String[] DEST_NAMES  = { "概览", "测试", "画面", "记录", "设置" };   /* v9.57：设置排最后 ✓ */
+    private static final String[] DEST_ICONS  = { "ic_tab_overview", "ic_tab_test", "ic_tab_render", "ic_tab_log", "ic_tab_log" };
+    private static final String[] DEST_GLYPHS = { "▦", "▤", "▶", "▥", "⚙" };
+    private static final int SEG_TEST_DRIVER = 0, SEG_TEST_VERIFY = 1, SEG_TEST_BENCH = 2, SEG_TEST_AB = 3;
+    private static final int SEG_RENDER_LIVE = 0, SEG_RENDER_LIT = 1, SEG_RENDER_STRESS = 2;
+    private static final int SEG_REC_SCORE = 0, SEG_REC_REPORT = 1, SEG_REC_LOG = 2;
     private final Button[] tabBtns = new Button[TAB_NAMES.length];
     private final View[]   tabPages = new View[TAB_NAMES.length];
     private FrameLayout content;
@@ -148,6 +206,41 @@ public class MainActivity extends Activity {
     private final java.util.WeakHashMap<View, Integer> textKeys = new java.util.WeakHashMap<>();
     private final java.util.WeakHashMap<View, Integer> bgKeys   = new java.util.WeakHashMap<>();   /* 值 = 填充键*100 + 圆角 */
     private final java.util.WeakHashMap<Button, Boolean> tabStates = new java.util.WeakHashMap<>();
+
+    /* ---------------- v6.1 App 骨架：App Bar + 底部导航 + FAB + 二级分段 ---------------- */
+    private final View[] destPages = new View[5];
+    private LinearLayout appBar, statusStrip, bottomNav;
+    private TextView appTitle, driverChip, busyChip;
+    private Button themeBtnTop;
+    private final View[]   navItems = new View[5];
+    private final View[]   navIndicators = new View[5];
+    private final TextView[] navLabels = new TextView[5];
+    private final View[]   navIcons = new View[5];
+    private int curDest = -1;
+    private int segTest = 0, segRender = 0, segRec = 0;
+    private View[] hubTestPages, hubRenderPages, hubRecPages;
+    private TextView[][] segPills = new TextView[3][];      /* [测试/画面/记录][段] */
+    private final java.util.WeakHashMap<View, Integer> iconKeys = new java.util.WeakHashMap<>();  /* ImageView 着色 */
+    private final java.util.List<Button> primaryBtns = new java.util.ArrayList<>();   /* 语义按钮：主题切换时要重刷 */
+    private final java.util.List<Button> dangerBtns  = new java.util.ArrayList<>();
+    private ImageView blurBackdrop;                         /* ③ 磨砂底衬（只模糊它自己的快照 ⇒ 文字不糊 ✓） */
+    private TextView fab;                                   /* 每页一个主操作（FAB） */
+    private Runnable fabAction;
+    private TextView scoreTable;                              /* 记录→成绩 */
+    private View scoreEmpty;                                  /* 记录→成绩 的空状态 */
+
+    /* ---------------- 一键跑全部驱动（v6.3）：串行遍历 + 实时行 + 排名表 ---------------- */
+    private LinearLayout rankBox, failBox;                     /* 排名表 / 失败表（自绘行） */
+    private TextView rankRulesTx, rankTableTx, rankFailTx;
+    private volatile boolean sweepRunning = false;
+    private final java.util.List<double[]> sweepNums = new java.util.ArrayList<>();   /* {fill,blit,draw,duty} */
+    private final java.util.List<String>   sweepNames = new java.util.ArrayList<>();
+    private final java.util.List<Boolean>  sweepOk   = new java.util.ArrayList<>();
+    private final java.util.List<String>   sweepNote = new java.util.ArrayList<>();
+    private final java.util.HashMap<String, String> driverLabels = new java.util.HashMap<>();   /* path -> 显示名 */
+    /* 单跑解析器的"最新结果"（sweep 直接读它 ⇒ 不再自造一套匹配 ✗） */
+    private volatile double lastFill = -1, lastBlit = -1, lastDraw = -1, lastDuty = -1;
+    private volatile double lastGpuMs = -1, lastWallS = -1;
 
     /* ---------------- 驱动列表 ---------------- */
     private RadioGroup driverGroup;          /* ① Vulkan 驱动 */
@@ -189,6 +282,50 @@ public class MainActivity extends Activity {
     private volatile double stressMaxFrameMs = 100.0;    /* 停止阈值：平均帧时 > 100 ms */
     private final int[] stressRgb = { 8, 8, 25 };        /* 默认清屏色，与参考图一致 */
     private String lastDeviceRaw = "";                   /* 最近一次能力清单/冒烟里的设备行 */
+
+    /* ---------------- v7.0 光影设置面板 ---------------- */
+    private static final int LIT_W = 512, LIT_H = 512;
+    private int litSize = 256;   /* v9.20：默认降到 256² —— 512² 会把 GPU 打满，连系统合成器都拿不到 GPU 时间 ⇒ 整个 App 点不动 ✗ */
+    private ImageView litView;
+    private TextView litSummary, litStats, litPassTx, litNativeTx;   /* litNativeTx：原生返回行原样显示 ✓ */
+    private SeekBar litPassBar;
+    private final Bitmap[] litBufs = new Bitmap[2];
+    private volatile boolean m3dRunning = false;   /* v9.11 迷你 3D 运行标志（跨线程可见 ✓）*/
+    private Button m3dBtn;
+    private TextView shzStatusTx;          /* v9.53 设置卡：Shizuku 状态行 */
+    private volatile boolean fpsCap = false;  /* v9.53 帧率上限开关（默认不限）*/
+    private volatile boolean rt3dRunning = false;   /* v9.22：硬件光追接入 3D 测试 */
+    private Button rt3dBtn;
+    private final java.util.concurrent.atomic.AtomicBoolean uiPending = new java.util.concurrent.atomic.AtomicBoolean(false);   /* v9.18 */                          /* v9.14：迷你 3D 按钮要有引用，才能把文案切成「■ 停止」 ✓ */
+    private volatile boolean litRunning = false;
+    private Thread litThread;
+    private int litShadows = 1, litPcf = 3, litRes = 2048, litCubes = 36,
+                litBloom = 1, litTonemap = 1, litPasses = 1, litDebug = 0, litAnimate = 1;
+
+    /** 一行离散开关（pill）：键名 / 取值表 / 当前选中。 */
+    private static final class LitRow {
+        final String key; final int[] vals; final TextView[] pills; final String[] labels; int sel;
+        LitRow(String key, int[] vals, String[] labels, TextView[] pills, int sel) {
+            this.key = key; this.vals = vals; this.labels = labels; this.pills = pills; this.sel = sel;
+        }
+    }
+    private final java.util.List<LitRow> litRows = new java.util.ArrayList<>();
+
+    /* ---------------- v7.0 光追（大选项）：能开就真开，不能开明说 ✓ ---------------- */
+    private android.widget.Switch rtSwitch;
+    private TextView rtProbeTx, rtVerdictTx;
+    private Button rtRunBtn;
+    private LinearLayout rtCardBox;
+    private int rtOn = 0;                  /* 0/1，持久化键 lit_raytracing */
+    private volatile boolean rtProbing = false;
+    private int rtState = 0;               /* 0=空闲 1=BLAS 已建 */
+    private TextView rtInitTx;             /* nativeRtInit 返回行（原样） */
+    private Button rtCpuBtn;               /* CPU 光追参考图（下版接入） */
+    private ImageView rtView;              /* 光追画面（乒乓双缓冲显示，别撕裂 ✓） */
+    private final Bitmap[] rtBufs = new Bitmap[2];
+    private volatile boolean rtRunning = false;
+    private Thread rtThread;
+    private int rtFrames = 0;
 
     /* ---------------- 日志 ---------------- */
     private TextView logView;
@@ -271,13 +408,19 @@ public class MainActivity extends Activity {
             }
             busy = true; busyWhat = what;
         }
-        ui.post(() -> { for (Button b : actionButtons) if (b != null) b.setEnabled(false); });
+        ui.post(() -> {
+            for (Button b : actionButtons) if (b != null) b.setEnabled(false);
+            if (busyChip != null) busyChip.setVisibility(View.VISIBLE);   /* App Bar 忙碌指示 */
+        });
         return true;
     }
 
     private void release() {
         synchronized (this) { busy = false; busyWhat = null; }
-        ui.post(() -> { for (Button b : actionButtons) if (b != null) b.setEnabled(true); });
+        ui.post(() -> {
+            for (Button b : actionButtons) if (b != null) b.setEnabled(true);
+            if (busyChip != null) busyChip.setVisibility(View.GONE);
+        });
     }
 
     /* =========================================================================
@@ -290,68 +433,35 @@ public class MainActivity extends Activity {
         rootV = new LinearLayout(this);
         rootV.setOrientation(LinearLayout.VERTICAL);
         rootV.setBackgroundColor(c(C_BG));
-        int p = dp(12);
-        rootV.setPadding(p, p, p, dp(6));
 
-        rootV.addView(text("GPU 驱动测试台 v2.0", 19, C_TEXT, true));
-        rootV.addView(text("OPPO PHZ110 · 天玑 9300 · Immortalis-G720 MC12 · 无 root", 11, C_DIM, false));
+        rootV.addView(buildAppBar());                       /* A. App Bar 56dp + 状态行 24dp */
 
-        headerDriver = text("当前驱动：未选择", 13, C_ACCENT, true);
-        headerDriver.setPadding(0, dp(6), 0, 0);
-        rootV.addView(headerDriver);
-
-        headerStatus = text("就绪。先到「驱动」页扫描或提取一个 .so。", 12, C_NEUTRAL, false);
-        headerStatus.setSingleLine(true);
-        headerStatus.setEllipsize(TextUtils.TruncateAt.END);
-        rootV.addView(headerStatus);
-
-        /* --- 手写页签栏 --- */
-        LinearLayout bar = new LinearLayout(this);
-        bar.setOrientation(LinearLayout.HORIZONTAL);
-        bar.setPadding(0, dp(8), 0, dp(6));
-        for (int i = 0; i < TAB_NAMES.length; i++) {
-            final int idx = i;
-            Button t = new Button(this);
-            t.setText(TAB_NAMES[i]);
-            /* v5.4：页签图标（按名字匹配，不依赖页签顺序 ✓）*/
-            int ic = tabIconRes(TAB_NAMES[i]);
-            if (ic != 0) {
-                t.setCompoundDrawablesWithIntrinsicBounds(0, ic, 0, 0);
-                t.setCompoundDrawablePadding(dp(2));
-            }
-            t.setAllCaps(false);
-            t.setTextSize(12);
-            t.setPadding(0, dp(2), 0, dp(2));
-            t.setMinWidth(0); t.setMinimumWidth(0);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0,
-                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-            lp.setMargins(dp(2), 0, dp(2), 0);
-            t.setLayoutParams(lp);
-            t.setOnClickListener(v -> switchTab(idx));
-            tabBtns[i] = t;
-            bar.addView(t);
-        }
-        rootV.addView(bar);
-
-        content = new FrameLayout(this);
+        content = new FrameLayout(this);                    /* B. 内容宿主（含 FAB 叠层） */
         rootV.addView(content, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        tabPages[TAB_OVERVIEW] = buildOverviewPage();
-        tabPages[TAB_DRIVER]   = buildDriverPage();
-        tabPages[TAB_TEST]     = buildTestPage();
-        tabPages[TAB_PICTURE]  = buildPicturePage();
-        tabPages[TAB_BENCH]    = buildBenchPage();
-        tabPages[TAB_LOG]      = buildLogPage();
-        tabPages[TAB_STRESS]   = buildStressPage();
-        for (View v : tabPages) {
+        destPages[DEST_OVERVIEW] = safePage("概览", () -> buildOverviewPage());
+        destPages[DEST_TEST]     = safePage("测试", () -> buildTestHubPage());
+        destPages[DEST_RENDER]   = safePage("画面", () -> buildRenderHubPage());
+        destPages[DEST_RECORDS]  = safePage("记录", () -> buildRecordsHubPage());
+        destPages[DEST_SETTINGS] = safePage("设置", () -> buildSettingsPage());   /* v9.57 */
+        for (View v : destPages) {
             v.setVisibility(View.GONE);
             content.addView(v, new FrameLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         }
+        blurBackdrop = new ImageView(this);                 /* ③ 快照层：位置在页面之下、栏之内 ⇒ 只模糊它 */
+        blurBackdrop.setScaleType(ImageView.ScaleType.FIT_XY);
+        blurBackdrop.setVisibility(View.GONE);
+        content.addView(blurBackdrop, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        content.addView(buildFab(), fabLp());               /* 每页一个主操作 */
+
+        rootV.addView(buildBottomNav());                    /* C. 底部导航 64dp */
 
         setContentView(rootV);
-        switchTab(TAB_OVERVIEW);
+        try { selectDest(DEST_OVERVIEW, 0, false); }
+        catch (Throwable t) { log("  ✗ 初始页选择失败（已忽略，不影响进入）: " + t); }
         log("GPU 驱动测试台 v" + appVersion() + " 启动。");
         refreshDeviceCards();
         scanDrivers();
@@ -361,10 +471,14 @@ public class MainActivity extends Activity {
         /* B7：退到后台就停渲染（放 onStop 不放 onPause —— 文件选择器/授权页只触发 onPause） */
         if (renderRunning || renderThread != null) stopRender("退到后台");
         if (stressRunning || stressThread != null) stopStress("退到后台");
+        if (litRunning || litThread != null) stopLit("退到后台");
+        if (rtRunning || rtThread != null) stopRt("退到后台");
         super.onStop();
     }
 
     @Override protected void onDestroy() {
+        try { nativeLitStop(); } catch (Throwable ignored) { }   /* v7.0：光影收尾 */
+        try { nativeRtStop(); } catch (Throwable ignored) { }    /* v7.4：光追收尾（安全可调用 ✓） */
         /* 退出时不必等 join（进程都要没了）：置标志 + 让原生停掉，循环下一轮自然退出。 */
         renderRunning = false;
         stressRunning = false;
@@ -378,31 +492,55 @@ public class MainActivity extends Activity {
     /* =========================================================================
      *  页签切换
      * ========================================================================= */
-    private void switchTab(int idx) {
-        if (idx == curTab) return;
-        /* 离开「画面」页 -> 按规格停掉渲染，避免后台空转 */
-        if (curTab == TAB_PICTURE && (renderRunning || renderThread != null)) stopRender("切走页面");
-        if (curTab == TAB_STRESS && (stressRunning || stressThread != null)) stopStress("切走页面");
-        curTab = idx;
-        for (int i = 0; i < tabPages.length; i++) {
-            tabPages[i].setVisibility(i == idx ? View.VISIBLE : View.GONE);
-            styleTab(tabBtns[i], i == idx);
+    /** 旧调用点兼容：把原 7 页签索引映射成 (目的地, 二级分段)。 */
+    private void switchTab(int legacy) {
+        switch (legacy) {
+            case TAB_OVERVIEW: selectDest(DEST_OVERVIEW, 0, true); break;
+            case TAB_DRIVER:   selectDest(DEST_TEST, SEG_TEST_DRIVER, true); break;
+            case TAB_TEST:     selectDest(DEST_TEST, SEG_TEST_VERIFY, true); break;
+            case TAB_BENCH:    selectDest(DEST_TEST, SEG_TEST_BENCH, true); break;
+            case TAB_PICTURE:  selectDest(DEST_RENDER, SEG_RENDER_LIVE, true); break;
+            case TAB_STRESS:   selectDest(DEST_RENDER, SEG_RENDER_STRESS, true); break;
+            case TAB_LOG:      selectDest(DEST_RECORDS, SEG_REC_LOG, true); break;
+            default:           selectDest(DEST_OVERVIEW, 0, true); break;
         }
+        curTab = legacy;                                     /* 兼容字段：老代码只读它做判据 */
     }
 
-    /* v5.4：页签图标映射（按名字，顺序无关；用 getIdentifier 而不依赖 R —— 免 Gradle 构建未生成 R.java）*/
-    private int tabIconRes(String n) {
-        String nm = null;
-        if (n == null) return 0;
-        if (n.contains("概览")) nm = "ic_tab_overview";
-        else if (n.contains("驱动")) nm = "ic_tab_driver";
-        else if (n.contains("测试")) nm = "ic_tab_test";
-        else if (n.contains("画面")) nm = "ic_tab_render";
-        else if (n.contains("压力")) nm = "ic_tab_stress";
-        else if (n.contains("跑分")) nm = "ic_tab_bench";
-        else if (n.contains("日志")) nm = "ic_tab_log";
-        if (nm == null) return 0;
-        return getResources().getIdentifier(nm, "drawable", getPackageName());
+    /** 底部导航切换：先收尾离开的页面（渲染/压力线程），再切页 + 分段，内容淡入 225ms。 */
+    private void selectDest(int dest, int seg, boolean animate) {
+        if (dest == curDest && seg < 0) return;
+        /* 离开「画面」目的地 ⇒ 停掉在跑的画面/压力任务（不打断跑分：那是另一套 claim） */
+        if (curDest == DEST_RENDER && dest != DEST_RENDER) {
+            if (renderRunning || renderThread != null) stopRender("切走页面");
+            if (stressRunning || stressThread != null) stopStress("切走页面");
+            if (litRunning || litThread != null) stopLit("切走页面");
+            if (rtRunning || rtThread != null) stopRt("切走页面");
+        }
+        if (dest == DEST_RENDER && seg >= 0 && seg != segRender) {   /* 段内切换：停掉离开那段的任务 */
+            if (segRender == SEG_RENDER_LIVE && (renderRunning || renderThread != null)) stopRender("切到别的分段");
+            if (segRender == SEG_RENDER_STRESS && (stressRunning || stressThread != null)) stopStress("切到别的分段");
+            if (segRender == SEG_RENDER_LIT && (litRunning || litThread != null)) stopLit("切到别的分段");
+            if (segRender == SEG_RENDER_LIT && (rtRunning || rtThread != null)) stopRt("切到别的分段");
+        }
+        curDest = dest;
+        for (int i = 0; i < destPages.length; i++)
+            destPages[i].setVisibility(i == dest ? View.VISIBLE : View.GONE);
+        if (appTitle != null) appTitle.setText(DEST_NAMES[dest]);
+        styleBottomNav();
+        updateFab();
+        if (seg >= 0) {
+            if (dest == DEST_TEST)    segTest = seg;
+            if (dest == DEST_RENDER)  segRender = seg;
+            if (dest == DEST_RECORDS) segRec = seg;
+        }
+        applySegments();
+        refreshBackdrop(dest);                              /* ③ 切页后刷新磨砂底衬（快照 1/4 缩放 + API31 真模糊） */
+        if (animate && destPages[dest] != null) {
+            destPages[dest].setAlpha(0f);
+            destPages[dest].animate().alpha(1f).setDuration(260)          /* ④ 260ms 流体 */
+                    .setInterpolator(new android.view.animation.PathInterpolator(0.0f, 0.0f, 0.2f, 1.0f)).start();
+        }
     }
 
     private void styleTab(Button t, boolean on) {
@@ -444,13 +582,13 @@ public class MainActivity extends Activity {
         col.addView(card(section("当前驱动"), ovDrv));
 
         themeBtn = actionBtn(themeLabel(), v -> cycleTheme());       /* 🎨 标签即当前主题，一眼可见 ✓ */
+        /* v9.60b · 概览页只留「最常用」：主题切换 + 一键全流程 + 跑分。
+         * 扫描/提取/日志这些在「测试」页有完整分组（v9.60 拆好的 4 组）⇒ 这里不再重复 ✗ */
         col.addView(card(section("快捷操作"),
                 themeBtn,
-                actionBtn("① 扫描驱动与渲染器（分类：ICD / 渲染器）", v -> { switchTab(TAB_DRIVER); scanDrivers(); }),
-                actionBtn("⑩ 一键全流程自测（冒烟→三角形→三种跑分）", v -> runAll()),
-                actionBtn("② 从 APK 提取驱动 .so", v -> { switchTab(TAB_DRIVER); pickApkForExtract(); }),
-                actionBtn("⑦ 拉起 Minecraft 启动器", v -> launchChooser()),
-                actionBtn("⑪ 读取启动器日志（FCL / ZL2）", v -> { switchTab(TAB_LOG); readLauncherLogs(); })));
+                actionBtn("一键全流程自测（冒烟→三角形→三种跑分）", v -> runAll()),
+                actionBtn("拉起 Minecraft 启动器", v -> launchChooser()),
+                actionBtn("读取启动器日志（FCL / ZL2）", v -> { switchTab(TAB_LOG); readLauncherLogs(); })));
         return scroll(col);
     }
 
@@ -484,8 +622,8 @@ public class MainActivity extends Activity {
             g.append("刷新率    : ").append(String.format(Locale.ROOT, "%.0f", refreshHz())).append(" Hz\n");
         } catch (Throwable ignored) { }
         g.append("GLES      : ").append(gles).append('\n');
-        g.append("测试方式  : 直接 dlopen 驱动 .so + vk_icdGetInstanceProcAddr\n");
-        g.append("            （不经过系统 Vulkan loader）");
+        g.append("测试方式  : " + (isSystemDriver() ? "系统 Vulkan loader（原生）" : "直接 dlopen 驱动 .so + vk_icdGetInstanceProcAddr") + "\n");
+        g.append("            " + (isSystemDriver() ? "（经系统 loader，与系统其它应用同一条路径）" : "（不经过系统 Vulkan loader）") + "\n");
         ovGpu.setText(g.toString());
 
         updateSelectedHeader();
@@ -508,20 +646,61 @@ public class MainActivity extends Activity {
                    + "· 本地 .so：/sdcard/Mali驱动项目/驱动、/sdcard/Download、"
                    + "Android/data/com.dsh.gputest/files/drivers\n"
                    + "· 从任意 APK 里提取（自动优先 arm64 + 像 ICD 的那个）"),
-                actionBtn("① 扫描驱动与渲染器（后台分类，不卡界面）", v -> scanDrivers()),
-                actionBtn("② 从 APK 提取驱动 .so", v -> pickApkForExtract()),
-                actionBtn("③ 安装驱动插件 APK（会话式安装，不用 file://）", v -> pickApkForInstall()),
-                actionBtn("⑪b 授权「所有文件访问」（读启动器日志/更多目录）", v -> requestAllFiles()),
-                actionBtn("⑬ 系统驱动对照（同一套测试跑系统驱动）", v -> runSystemBaseline())));
+                actionBtn("扫描驱动与渲染器", v -> scanDrivers()),
+                actionBtn("从 APK 提取驱动 .so", v -> pickApkForExtract()),
+                actionBtn("安装驱动插件 APK", v -> pickApkForInstall())));
 
-        col.addView(section("① Vulkan 驱动（选一个用于测试）"));
+        /* ---- v9.60 · 按功能分组：诊断与数据 ---- */
+        col.addView(card(section("诊断与数据"),
+                note("需要 Stellar/Shizuku 授权（设置页可申请）。"
+                   + "拿到的是 shell 级真数据：GPU 频率、温度、系统面。"),
+                actionBtn("Shizuku/Stellar 探针", v -> shizukuProbe())));
+
+        /* ---- v9.60 · 按功能分组：渲染控制 ---- */
+        col.addView(card(section("渲染控制"),
+                actionBtn("一键全流程自测", v -> runAll()),
+                actionBtn("开始 / 停止渲染", v -> toggleRender()),
+                actionBtn("开始 / 停止光影渲染", v -> toggleLit())));
+
+        /* ---- v9.60 · 按功能分组：系统与维护 ---- */
+        col.addView(card(section("系统与维护"),
+                actionBtn("授权「所有文件访问」", v -> requestAllFiles()),
+                actionBtn("系统驱动对照", v -> runSystemBaseline()),
+                actionBtn("导出日志", v -> exportLog())));
+
+        /* ⑤ 悬浮式搜索栏：过滤下面的驱动/渲染器列表（半透磨砂 + 1dp 描边 + 大圆角） */
+        EditText search = new EditText(this);
+        search.setHint("搜索驱动 / 渲染器…");
+        search.setSingleLine(true);
+        search.setTextSize(14);
+        search.setTextColor(c(C_TEXT));
+        search.setHintTextColor(c(C_DIM));
+        textKeys.put(search, C_TEXT);
+        search.setBackground(themedBg(C_BTN_BG, x(1)));
+        search.setPadding(dp(16), dp(12), dp(16), dp(12));
+        search.addTextChangedListener(new android.text.TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s2, int a, int b, int c2) { }
+            @Override public void onTextChanged(CharSequence s2, int a, int b, int c2) { }
+            @Override public void afterTextChanged(android.text.Editable e) {
+                String q = e == null ? "" : e.toString().trim().toLowerCase(Locale.ROOT);
+                filterGroup(driverGroup, q);
+                filterGroup(rendererGroup, q);
+            }
+        });
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.setMargins(dp(12), dp(12), dp(12), dp(4));
+        search.setLayoutParams(slp);
+        col.addView(search);
+
+        col.addView(section("Vulkan 驱动（选一个用于测试）"));
         driverGroup = new RadioGroup(this);
         driverGroup.setOrientation(RadioGroup.VERTICAL);
         driverGroup.setOnCheckedChangeListener((g, id) -> updateSelectedHeader());
         col.addView(card(driverGroup,
                 note("这一组是「渲染器底下的驱动」——启动器里 Vulkan 驱动器下拉的那几个。")));
 
-        col.addView(section("② 渲染器（跑在 Vulkan 驱动之上）"));
+        col.addView(section("渲染器（跑在 Vulkan 驱动之上）"));
         rendererGroup = new RadioGroup(this);
         rendererGroup.setOrientation(RadioGroup.VERTICAL);
         rendererGroup.setOnCheckedChangeListener((g, id) -> updateSelectedHeader());
@@ -530,7 +709,7 @@ public class MainActivity extends Activity {
                    + "「渲染器 × 驱动」的组合测试是下一步：用 Vulkan 垫片把渲染器的 "
                    + "dlopen(\"libvulkan.so\") 转发到上面选中的驱动 ICD。")));
 
-        col.addView(section("③ 打不开 / 未知（仅列出，不参与测试）"));
+        col.addView(section("打不开 / 未知（仅列出，不参与测试）"));
         unknownBox = new LinearLayout(this);
         unknownBox.setOrientation(LinearLayout.VERTICAL);
         col.addView(card(unknownBox));
@@ -545,7 +724,7 @@ public class MainActivity extends Activity {
          * 省掉原来那个独立的「⑬ 系统驱动对照」按钮。原生侧已支持特殊路径 "system"。 */
         {
             RadioButton sys = new RadioButton(this);
-            sys.setText("🖥  使用系统驱动（对照 · 系统 Vulkan loader）");
+            sys.setText("🖥  原生 Vulkan（系统 loader）");
             sys.setTextColor(c(C_TEXT)); textKeys.put(sys, C_TEXT);
             sys.setTag(driverPaths.size());
             driverPaths.add("system");
@@ -735,6 +914,7 @@ public class MainActivity extends Activity {
     /** 入库：c.cls 决定它进 ①驱动 还是 ②渲染器（调用方已分好组）。元信息后台算。 */
     private RadioButton addEntry(RadioGroup group, List<String> paths, Cand c, String role) {
         paths.add(c.path);
+        driverLabels.put(c.path, c.label + " ［" + shortTag(c.source) + "］");   /* ④ 同名也分得清 */
         final int idx = paths.size() - 1;
 
         RadioButton rb = new RadioButton(this);
@@ -778,8 +958,10 @@ public class MainActivity extends Activity {
     /** 头部常驻：【驱动: X ｜ 渲染器: Y】（渲染器是"跑在驱动之上"的那一层）。 */
     private void updateSelectedHeader() {
         final String d = selectedPath(), r = selectedRendererPath();
-        headerDriver.setText("驱动: " + (d == null ? "未选择" : new File(d).getName())
-                + "  ｜  渲染器: " + (r == null ? "未选择" : new File(r).getName()));
+        if (headerDriver != null) {                          /* App Bar 里的"驱动 chip"只放短标签 */
+            headerDriver.setText("驱动: " + (d == null ? "未选择" : new File(d).getName()));
+            headerDriver.setTextColor(c(d == null ? C_WARN : C_ACCENT));
+        }
         StringBuilder s = new StringBuilder();
         s.append("[① Vulkan 驱动] ").append(d == null ? "未选择" : d).append('\n');
         if (d != null) {
@@ -1102,9 +1284,9 @@ public class MainActivity extends Activity {
         col.addView(card(section("单项测试"),
                 note("三项互相独立：冒烟只看能不能建实例/设备；三角形会真画并逐像素校验；"
                    + "能力清单倒出设备/限制/扩展/内存堆。"),
-                actionBtn("④ ICD 冒烟（dlopen → 协商 → 实例 → 设备 → 队列）", v -> runSmoke()),
-                actionBtn("⑤ 三角形绘制 + 像素校验（应出现纯红三角形）", v -> runTri()),
-                actionBtn("⑭ 能力清单（设备 / 限制 / 扩展 / 内存堆）", v -> runCaps())));
+                actionBtn("ICD 冒烟（dlopen → 协商 → 实例 → 设备 → 队列）", v -> runSmoke()),
+                actionBtn("三角形绘制 + 像素校验（应出现纯红三角形）", v -> runTri()),
+                actionBtn("能力清单（设备 / 限制 / 扩展 / 内存堆）", v -> runCaps())));
 
         capsText = text("还没跑能力清单。", 11, C_TEXT, false);
         capsText.setTypeface(Typeface.MONOSPACE);
@@ -1259,9 +1441,9 @@ public class MainActivity extends Activity {
         benchBlit = bigNum("—");
         benchDraw = bigNum("—");
         col.addView(card(section("单项跑分（每项 5 秒）"),
-                actionBtn("⑥ 填充率 fill", v -> runBench("fill")),
-                actionBtn("⑥b 拷贝带宽 blit", v -> runBench("blit")),
-                actionBtn("⑥c 三角形吞吐 draw", v -> runBench("draw"))));
+                actionBtn("填充率 fill", v -> runBench("fill")),
+                actionBtn("拷贝带宽 blit", v -> runBench("blit")),
+                actionBtn("三角形吞吐 draw", v -> runBench("draw"))));
 
         col.addView(card(section("最近成绩"),
                 numRow("填充率", benchFill, "Mpixel/s"),
@@ -1298,10 +1480,30 @@ public class MainActivity extends Activity {
                 note("每次开跑前旧成绩一律作废；下面会标出成绩来自哪个驱动 —— "
                    + "避免把上一次（例如系统驱动）的数字当成这一次的。")));
 
+        rankRulesTx = note("排序口径（透明）：综合分 = 0.4×fill/最优fill + 0.3×blit/最优blit + 0.3×draw/最优draw，"
+                + "各自相对最优归一化 ⇒ 满分 100；**任一项失败/DEVICE_LOST ⇒ 不计入排名**，单列失败表。"
+                + "每档 5 秒，逐个驱动串行。");
+        rankTableTx = text("（还没跑）", 11, C_TEXT, false);
+        rankTableTx.setTypeface(Typeface.MONOSPACE);
+        rankTableTx.setLineSpacing(0, 1.2f);
+        failBox = new LinearLayout(this);
+        failBox.setOrientation(LinearLayout.VERTICAL);
+        rankFailTx = text("（无失败项）", 11, C_DIM, false);
+        rankFailTx.setTypeface(Typeface.MONOSPACE);
+
+        col.addView(card(section("⚑ 一键跑全部驱动（排名）"),
+                rankRulesTx,
+                btnPrimary("一键跑全部驱动（逐个串行 · fill/blit/draw 各 5 秒）", v -> runAllDriversSweep()),
+                btnTonal("复制排名表", v -> copyRankTable()),
+                btnTonal("一键跑全部渲染器（转译链未接入）", v -> runAllRenderersStub()),
+                rankTableTx));
+
+        col.addView(card(section("失败项（不计入排名）"), rankFailTx));
+
         col.addView(card(section("全流程与对比"),
-                actionBtn("⑩ 一键全流程自测（冒烟→三角形→能力清单→三种跑分）", v -> runAll()),
-                actionBtn("⑫ 把当前驱动设为对比基准 A", v -> setBaseline()),
-                actionBtn("⑫b A/B 对比：基准 A vs 当前 B", v -> compareAB()),
+                actionBtn("一键全流程自测（冒烟→三角形→能力清单→三种跑分）", v -> runAll()),
+                actionBtn("把当前驱动设为对比基准 A", v -> setBaseline()),
+                actionBtn("A/B 对比：基准 A vs 当前 B", v -> compareAB()),
                 note("A/B 会依次跑 冒烟 + 三角形 + 三种跑分，最后两段汇总数字可直接对比。")));
         return scroll(col);
     }
@@ -1312,10 +1514,10 @@ public class MainActivity extends Activity {
     private View buildLogPage() {
         LinearLayout col = col();
         col.addView(card(section("日志操作"),
-                actionBtn("⑪ 读取启动器日志（FCL / ZalithLauncher / ZL2）", v -> readLauncherLogs()),
-                actionBtn("⑪b 授权「所有文件访问」", v -> requestAllFiles()),
-                actionBtn("⑧ 导出 / 分享日志", v -> exportLog()),
-                actionBtn("⑨ 清空日志", v -> {
+                actionBtn("读取启动器日志（FCL / ZalithLauncher / ZL2）", v -> readLauncherLogs()),
+                actionBtn("授权「所有文件访问」", v -> requestAllFiles()),
+                actionBtn("导出 / 分享日志", v -> exportLog()),
+                actionBtn("清空日志", v -> {
                     synchronized (fullLog) { fullLog.setLength(0); }
                     sharedTruncated = false;      /* ★ C10：复位 ⇒ 下次写共享日志会重新截断（否则旧内容留着） */
                     logView.setText("");
@@ -1386,10 +1588,10 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    private void runSmoke() { runNative("④ ICD 冒烟", 0, null); }
-    private void runTri()   { runNative("⑤ 三角形绘制 + 像素校验", 1, null); }
-    private void runCaps()  { runNative("⑭ 能力清单", 3, null); }
-    private void runBench(String mode) { runNative("⑥ 跑分 · " + mode, 2, mode); }
+    private void runSmoke() { runNative("ICD 冒烟", 0, null); }
+    private void runTri()   { runNative("三角形绘制 + 像素校验", 1, null); }
+    private void runCaps()  { runNative("能力清单", 3, null); }
+    private void runBench(String mode) { runNative("跑分 · " + mode, 2, mode); }
 
     private void runAll() {
         final String p = selectedPath();
@@ -1580,25 +1782,33 @@ public class MainActivity extends Activity {
             return;
         }
 
-        final String fill  = grab(out, "填充率\\s*:\\s*([0-9.]+)");
-        final String blit  = grab(out, "拷贝带宽\\s*:\\s*([0-9.]+)");
-        final String tri   = grab(out, "三角形吞吐\\s*:\\s*([0-9.]+)");
+        /* ① 优先取原生**自己的成绩行** `== 分数(fill) = 558 Mpixel/s ==`，再退回汇总标签 */
+        String fill  = grab(out, "分数\\(fill\\)\\s*=\\s*([0-9.]+)");
+        String blit  = grab(out, "分数\\(blit\\)\\s*=\\s*([0-9.]+)");
+        String tri   = grab(out, "分数\\(draw\\)\\s*=\\s*([0-9.]+)");
+        if (fill == null) fill = grab(out, "填充率\\s*:\\s*([0-9.]+)");
+        if (blit == null) blit = grab(out, "拷贝带宽\\s*:\\s*([0-9.]+)");
+        if (tri  == null) tri  = grab(out, "三角形吞吐\\s*:\\s*([0-9.]+)");
         final String score = grab(out, "综合分:\\s*([0-9.]+)");
         if (fill == null && blit == null && tri == null && score == null) return;   /* 这批输出里没有成绩 */
         parseTiming(out);                                                           /* (c)：时间三件套 */
+        try { if (fill != null) lastFill = Double.parseDouble(fill); } catch (Throwable ignored) { }
+        try { if (blit != null) lastBlit = Double.parseDouble(blit); } catch (Throwable ignored) { }
+        try { if (tri  != null) lastDraw = Double.parseDouble(tri);  } catch (Throwable ignored) { }
         final boolean anyFail = out.contains("失败统计")
                 && !Pattern.compile("失败统计\\s*:\\s*fill=0 blit=0 draw=0", Pattern.DOTALL).matcher(out).find();
+        final String fFill = fill, fBlit = blit, fTri = tri;   /* lambda 捕获需 final ✓ */
         ui.post(() -> {
-            if (fill != null && benchFill != null) { benchFill.setText(fill); tint(benchFill, anyFail ? C_WARN : C_OK); }
-            if (blit != null && benchBlit != null) { benchBlit.setText(blit); tint(benchBlit, anyFail ? C_WARN : C_OK); }
-            if (tri != null && benchDraw != null)  { benchDraw.setText(tri);  tint(benchDraw, anyFail ? C_WARN : C_OK); }
+            if (fFill != null && benchFill != null) { setNumFade(benchFill, fFill); tint(benchFill, anyFail ? C_WARN : C_OK); }
+            if (fBlit != null && benchBlit != null) { setNumFade(benchBlit, fBlit); tint(benchBlit, anyFail ? C_WARN : C_OK); }
+            if (fTri != null && benchDraw != null)  { setNumFade(benchDraw, fTri);  tint(benchDraw, anyFail ? C_WARN : C_OK); }
             if (score != null) {
                 if (benchScore != null) { benchScore.setText(score); tint(benchScore, anyFail ? C_WARN : C_OK); }
                 if (ovScore != null)    { ovScore.setText(score);    tint(ovScore, anyFail ? C_WARN : C_OK); }
             }
             if (ovSummary != null) {
-                ovSummary.setText("填充 " + nz(fill) + " Mpixel/s · 带宽 " + nz(blit) + " GB/s · 三角形 "
-                        + nz(tri) + " 个/s" + (score != null ? "  ⇒  综合分 " + score : ""));
+                ovSummary.setText("填充 " + nz(fFill) + " Mpixel/s · 带宽 " + nz(fBlit) + " GB/s · 三角形 "
+                        + nz(fTri) + " 个/s" + (score != null ? "  ⇒  综合分 " + score : ""));
             }
             if (benchNote != null) {
                 benchNote.setText("✅ 本次成绩（驱动：" + owner + "）"
@@ -1622,6 +1832,13 @@ public class MainActivity extends Activity {
             Matcher mw = P_WALL_S.matcher(out);
             if (mw.find()) wall = mw.group(1);
         } catch (Throwable ignored) { }
+        try {
+            if (gpu != null)  lastGpuMs = Double.parseDouble(gpu);
+            if (wall != null) lastWallS = Double.parseDouble(wall);
+        } catch (Throwable ignored) { }
+        String dutyS = grab(out, "GPU\\s*占空比\\s*[=:]\\s*([0-9.]+)");
+        if (dutyS == null) dutyS = grab(out, "([0-9.]+)\\s*%\\s*墙钟");
+        if (dutyS != null) { try { lastDuty = Double.parseDouble(dutyS); } catch (Throwable ignored) { } }
         StringBuilder proof = new StringBuilder();
         for (String ln : out.split("\n")) {
             String t = ln.trim();
@@ -1908,6 +2125,26 @@ public class MainActivity extends Activity {
         return c;
     }
 
+    /** 凝光卡片/控件底：半透表面 + 极轻线性渐变 + 可选高光边（LayerDrawable）。全平台 API ✓ */
+    private android.graphics.drawable.Drawable themedBg(int fillKey, int radiusDp) {
+        int base = c(fillKey);
+        GradientDrawable g = new GradientDrawable();
+        if (x(4) > 0) {
+            g.setOrientation(GradientDrawable.Orientation.TOP_BOTTOM);
+            g.setColors(new int[] { lighten(base, x(4)), withAlpha(base, x(3)) });
+        } else {
+            g.setColor(withAlpha(base, x(3)));
+        }
+        g.setCornerRadius(dp(radiusDp));
+        g.setStroke(dp(1), c(C_STROKE));
+        if (x(5) <= 0) return g;
+        GradientDrawable hl = new GradientDrawable();          /* 内层 1dp 高光边 ⇒ "凝光"的高光感 */
+        hl.setColor(0x00000000);
+        hl.setCornerRadius(dp(Math.max(1, radiusDp - 1)));
+        hl.setStroke(dp(1), withAlpha(0xFFFFFF, x(5)));
+        return new android.graphics.drawable.LayerDrawable(new android.graphics.drawable.Drawable[] { g, hl });
+    }
+
     private GradientDrawable cardBg(int fill, int stroke, int radiusDp) {
         GradientDrawable g = new GradientDrawable();
         g.setColor(fill);
@@ -1920,7 +2157,7 @@ public class MainActivity extends Activity {
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
         bgKeys.put(c, C_CARD * 100 + 14);
-        c.setBackground(cardBg(c(C_CARD), c(C_STROKE), 14));
+        c.setBackground(themedBg(C_CARD, x(0)));               /* 主题切换时按新圆角/半透重刷 ✓ */
         int p = dp(14);
         c.setPadding(p, p, p, p);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -1981,7 +2218,8 @@ public class MainActivity extends Activity {
         b.setTextColor(c(C_TEXT));
         b.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
         bgKeys.put(b, C_BTN_BG * 100 + 12);
-        b.setBackground(cardBg(c(C_BTN_BG), c(C_STROKE), 12));
+        b.setBackground(themedBg(C_BTN_BG, x(1)));
+        fluid(b);                                              /* ② 柔性触控反馈 */
         b.setOnClickListener(l);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -2047,7 +2285,10 @@ public class MainActivity extends Activity {
             sb.setProgress(stressRgb[i]);
             sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
                 @Override public void onProgressChanged(SeekBar b, int p, boolean fromUser) {
-                    stressRgb[ch] = p; refreshRgbText();
+                    stressRgb[ch] = p;
+                    refreshRgbText();
+                    try { nativeStressClearColor(stressRgb[0], stressRgb[1], stressRgb[2]); }
+                    catch (Throwable ignored) { }        /* 原生未接入时不崩 */
                 }
                 @Override public void onStartTrackingTouch(SeekBar b) { }
                 @Override public void onStopTrackingTouch(SeekBar b) { }
@@ -2056,7 +2297,7 @@ public class MainActivity extends Activity {
             rgbCol.addView(sb);
         }
         col.addView(card(section("清屏色（与参考图默认一致：R8 G8 B25）"), stressRgbTx, rgbCol,
-                note("原生侧需要接一个 setter 才能生效 —— 建议 `nativeStressClearColor(int r,int g,int b)`；"
+                note("清屏色：压力场景的背景色（与参考图默认一致，便于逐像素比对）。"
                    + "R/G/B 我这边已存在字段里，你加一行接口我立刻接上。")));
 
         /* 统计面板（等宽小字，学图里那块） */
@@ -2183,7 +2424,7 @@ public class MainActivity extends Activity {
 
     private void refreshStressProgress() {
         ui.post(() -> {
-            if (stressProg != null) stressProg.setProgress(Math.min(stressCap, stressTri));
+            if (stressProg != null) stressProg.setProgress(Math.min(stressCap, stressTri), true);  /* ④ 进度 200ms 动效（平台 API） */
             if (stressProgTx != null) stressProgTx.setText(stressTri + " / " + stressCap
                     + "（" + (stressCap > 0 ? stressTri * 100 / stressCap : 0) + "%）");
         });
@@ -2233,8 +2474,1698 @@ public class MainActivity extends Activity {
         } catch (Throwable t) { return null; }
     }
 
+    /* =========================================================================
+     *  v6.1 App 骨架：App Bar(56dp) + 底部导航(64dp) + FAB + 页内分段(pill)
+     *  只用平台 API（无 androidx）；图标走 getIdentifier（**本构建不生成 R.java**）
+     * ========================================================================= */
+    private int drawableId(String name) {
+        try { return getResources().getIdentifier(name, "drawable", getPackageName()); }
+        catch (Throwable t) { return 0; }
+    }
+
+    /** 图标视图：优先 res/drawable 里的矢量图；取不到就退化成几何字符（任何构建都能显示）。 */
+    private View iconView(String name, String glyph, int sizeDp, int key) {
+        int id = drawableId(name);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp));
+        if (id != 0) {
+            ImageView iv = new ImageView(this);
+            iv.setImageResource(id);
+            iv.setColorFilter(c(key));
+            iv.setLayoutParams(lp);
+            iconKeys.put(iv, key);
+            return iv;
+        }
+        TextView tv = new TextView(this);
+        tv.setText(glyph);
+        tv.setTextSize(sizeDp * 0.62f);
+        tv.setGravity(Gravity.CENTER);
+        tint(tv, key);
+        tv.setLayoutParams(lp);
+        return tv;
+    }
+
+    private TextView pill(String label, int key, boolean filled) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setTextSize(12);
+        t.setSingleLine(true);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(dp(12), dp(6), dp(12), dp(6));
+        t.setTextColor(c(filled ? C_TAB_ON_TX : key));
+        textKeys.put(t, filled ? C_TAB_ON_TX : key);
+        stylePill(t, filled);
+        fluid(t);                                              /* 分段 pill 也吃柔性反馈 ✓ */
+        return t;
+    }
+
+    private void stylePill(TextView t, boolean filled) {
+        GradientDrawable g = new GradientDrawable();
+        g.setCornerRadius(dp(999));
+        if (filled) g.setColor(c(C_TAB_ON_BG));
+        else { g.setColor(0x00000000); g.setStroke(dp(1), c(C_STROKE)); }
+        t.setBackground(g);
+    }
+
+    private int blend(int color, int alphaHex) { return (color & 0x00FFFFFF) | (alphaHex << 24); }
+
+    /** A. App Bar：标题(22/500) + 忙碌指示 + 驱动 chip + 🎨主题；下面一条 12sp 状态行。 */
+    private View buildAppBar() {
+        appBar = new LinearLayout(this);
+        appBar.setOrientation(LinearLayout.VERTICAL);
+        appBar.setBackgroundColor(withAlpha(c(C_CARD), x(3)));   /* ③ 半透磨砂（ColorOS 90%） */
+        appBar.setElevation(dp(3));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setMinimumHeight(dp(56));
+        row.setPadding(dp(16), 0, dp(8), 0);
+
+        appTitle = new TextView(this);
+        appTitle.setText(DEST_NAMES[0]);
+        appTitle.setTextSize(22);
+        appTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        tint(appTitle, C_TEXT);
+        row.addView(appTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        busyChip = pill("● 忙", C_WARN, false);
+        busyChip.setVisibility(View.GONE);
+        row.addView(busyChip);
+
+        driverChip = pill("驱动: 未选择", C_ACCENT, false);
+        driverChip.setOnClickListener(v -> switchTab(TAB_DRIVER));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        clp.setMargins(dp(8), 0, dp(8), 0);
+        driverChip.setLayoutParams(clp);
+        row.addView(driverChip);
+        headerDriver = driverChip;                        /* 兼容老代码：只 setText/setTextColor */
+
+        View th = iconView("ic_theme", "🎨", 24, C_TEXT);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(dp(48), dp(48));
+        th.setLayoutParams(tlp);
+        th.setOnClickListener(v -> cycleTheme());
+        row.addView(th);
+
+        appBar.addView(row);
+
+        headerStatus = new TextView(this);
+        headerStatus.setText("就绪。先到「测试 → 驱动」扫描或提取一个 .so。");
+        headerStatus.setTextSize(12);
+        headerStatus.setSingleLine(true);
+        headerStatus.setEllipsize(TextUtils.TruncateAt.END);
+        headerStatus.setPadding(dp(16), 0, dp(16), dp(6));
+        tint(headerStatus, C_NEUTRAL);
+        appBar.addView(headerStatus);
+        return appBar;
+    }
+
+    /** C. 底部导航一项：56×32 激活指示器 + 24dp 图标 + 12sp 标签，整项 ≥64dp（热区达标）。 */
+    private View navItem(final int i) {
+        LinearLayout item = new LinearLayout(this);
+        item.setOrientation(LinearLayout.VERTICAL);
+        item.setGravity(Gravity.CENTER);
+        item.setMinimumHeight(dp(64));
+        item.setPadding(0, dp(6), 0, dp(6));
+
+        FrameLayout stack = new FrameLayout(this);
+        View ind = new View(this);
+        ind.setLayoutParams(new FrameLayout.LayoutParams(dp(56), dp(32), Gravity.CENTER));
+        navIndicators[i] = ind;
+        stack.addView(ind);
+
+        View ic = iconView(DEST_ICONS[i], DEST_GLYPHS[i], 24, C_DIM);
+        navIcons[i] = ic;
+        stack.addView(ic, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+        item.addView(stack, new LinearLayout.LayoutParams(dp(56), dp(32)));
+
+        TextView lab = new TextView(this);
+        lab.setText(DEST_NAMES[i]);
+        lab.setTextSize(12);
+        lab.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        lab.setGravity(Gravity.CENTER);
+        lab.setPadding(0, dp(4), 0, 0);
+        tint(lab, C_DIM);
+        navLabels[i] = lab;
+        item.addView(lab);
+
+        item.setOnClickListener(v -> selectDest(i, -1, true));
+        fluid(item);                                           /* 底部导航项柔性反馈 ✓ */
+        return item;
+    }
+
+    private View buildBottomNav() {
+        bottomNav = new LinearLayout(this);
+        bottomNav.setOrientation(LinearLayout.HORIZONTAL);
+        bottomNav.setMinimumHeight(dp(64));
+        bottomNav.setBackgroundColor(withAlpha(c(C_CARD), x(3)));
+        bottomNav.setElevation(dp(3));
+        for (int i = 0; i < DEST_NAMES.length; i++) {
+            navItems[i] = navItem(i);
+            bottomNav.addView(navItems[i], new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        }
+        return bottomNav;
+    }
+
+    private void styleBottomNav() {
+        for (int i = 0; i < 4; i++) {
+            boolean on = (i == curDest);
+            if (navIndicators[i] != null) {
+                GradientDrawable g = new GradientDrawable();
+                g.setCornerRadius(dp(16));
+                g.setColor(on ? blend(c(C_ACCENT), 0x22) : 0x00000000);
+                navIndicators[i].setBackground(g);
+            }
+            int key = on ? C_ACCENT : C_DIM;
+            if (navLabels[i] != null) tint(navLabels[i], key);
+            if (navIcons[i] instanceof ImageView) {
+                ((ImageView) navIcons[i]).setColorFilter(c(key));
+                iconKeys.put(navIcons[i], key);
+            } else if (navIcons[i] instanceof TextView) tint((TextView) navIcons[i], key);
+        }
+    }
+
+    /** 每页一个 FAB（同一时刻只有一个填充按钮 ⇒ 符合"一屏最多一个主操作"）。 */
+    private TextView buildFab() {
+        fab = new TextView(this);
+        fab.setTextSize(14);
+        fab.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        fab.setGravity(Gravity.CENTER);
+        fab.setPadding(dp(20), dp(14), dp(20), dp(14));
+        fab.setElevation(dp(6));
+        fab.setOnClickListener(v -> { Runnable a = fabAction; if (a != null) a.run(); });
+        return fab;
+    }
+
+    private FrameLayout.LayoutParams fabLp() {
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.END | Gravity.BOTTOM);
+        lp.setMargins(0, 0, dp(16), dp(16));
+        return lp;
+    }
+
+    /* v9.27: 当前是否走原生（系统 Vulkan loader）路径 */
+    private boolean isSystemDriver() { String p = selectedPath(); return p == null || p.equals("system"); }
+
+    /* v9.48 · Shizuku/Stellar 探针（经 IShizukuService 公开路径）*/
+    private static final String[] SHZ_CMDS = { "grep -H . /sys/class/devfreq/*/cur_freq", "grep -H . /sys/class/thermal/thermal_zone*/temp", "grep -H . /proc/gpufreq/gpufreq_opp_dump", "dumpsys SurfaceFlinger | head -20" };
+
+    private void shizukuProbe() {
+        if (!claim("Shizuku 探针")) return;
+        setStatus("Shizuku 探针：检查服务…", C_WARN);
+        new Thread(() -> {
+            StringBuilder sb = new StringBuilder();
+            try {
+                sb.append("binder 可达 = ").append(rikka.shizuku.Shizuku.pingBinder()).append("\n");
+                sb.append("uid = ").append(rikka.shizuku.Shizuku.getUid()).append("   version = ").append(rikka.shizuku.Shizuku.getVersion()).append("\n");
+                boolean ok = rikka.shizuku.Shizuku.checkSelfPermission() == android.content.pm.PackageManager.PERMISSION_GRANTED;
+                sb.append("权限 = ").append(ok ? "已授权" : "未授权").append("\n");
+                if (!ok) {
+                    ui.post(() -> { try { rikka.shizuku.Shizuku.requestPermission(0); } catch (Throwable t) { log("  ! requestPermission: " + t); } });
+                    sb.append("已发起授权请求 -> 请在 Stellar 界面点「允许」，然后再点一次本按钮").append("\n");
+                } else {
+                    moe.shizuku.server.IShizukuService svc = moe.shizuku.server.IShizukuService.Stub.asInterface(rikka.shizuku.Shizuku.getBinder());
+                    sb.append("service = ").append(svc == null ? "null" : "ok").append("\n");
+                    if (svc != null) for (String c : SHZ_CMDS) sb.append("$ ").append(c).append("\n").append(runShizuku(svc, c)).append("\n");
+                }
+            } catch (Throwable t) { sb.append("X 异常: ").append(t).append("\n"); }
+            final String txt = sb.toString();
+            logBlock("Shizuku 探针", txt);
+            ui.post(() -> { setStatus("Shizuku 探针：完成（原文见日志）", C_OK); try { new android.app.AlertDialog.Builder(this).setTitle("Shizuku / Stellar 探针").setMessage(txt).setPositiveButton("好", null).show(); } catch (Throwable ignored) { } });
+            endTask(); release();
+        }, "shizuku-probe").start();
+    }
+
+    private String runShizuku(moe.shizuku.server.IShizukuService svc, String cmd) {
+        try {
+            moe.shizuku.server.IRemoteProcess rp = svc.newProcess(new String[] { "sh", "-c", cmd }, null, null);
+            if (rp == null) return "（newProcess 返回 null）";
+            java.io.InputStream is = new android.os.ParcelFileDescriptor.AutoCloseInputStream(rp.getInputStream());
+            java.io.BufferedReader r = new java.io.BufferedReader(new java.io.InputStreamReader(is));
+            StringBuilder o = new StringBuilder();
+            String l; int n = 0;
+            while ((l = r.readLine()) != null && n++ < 14) o.append(l).append("\n");
+            rp.waitFor();
+            return o.length() == 0 ? "（无输出）" : o.toString();
+        } catch (Throwable t) { return "X newProcess 失败: " + t; }
+    }
+
+    /* ================= v9.53 · 设置卡（本软件专用） ================= */
+    private void openStellar() {
+        try {
+            android.content.Intent i = getPackageManager().getLaunchIntentForPackage("roro.stellar.manager");
+            if (i != null) startActivity(i); else toast("未找到 Stellar 管理器");
+        } catch (Throwable t) { toast("打开失败: " + t); }
+    }
+
+    private void shzRequest() {
+        try { rikka.shizuku.Shizuku.requestPermission(0); toast("已发起授权，请在 Stellar 里点「允许」"); }
+        catch (Throwable t) { toast("申请失败: " + t); }
+    }
+
+    private void shzRefresh() {
+        new Thread(() -> {
+            String out;
+            try {
+                boolean up = rikka.shizuku.Shizuku.pingBinder();
+                boolean ok = up && rikka.shizuku.Shizuku.checkSelfPermission() == android.content.pm.PackageManager.PERMISSION_GRANTED;
+                out = "Shizuku/Stellar: " + (up ? "在线" : "未运行")
+                    + " | version=" + (up ? rikka.shizuku.Shizuku.getVersion() : -1)
+                    + " | uid=" + (up ? rikka.shizuku.Shizuku.getUid() : -1)
+                    + " | 权限=" + (ok ? "已授权" : "未授权");
+            } catch (Throwable t) { out = "Shizuku 状态读取失败: " + t; }
+            final String f = out;
+            ui.post(() -> { if (shzStatusTx != null) shzStatusTx.setText(f); });
+            log("  " + f);
+        }, "shz-status").start();
+    }
+
+    /* ==================================================================
+     * v9.55 · 独立「设置」页（底部导航最后一项，排在「记录」之后）
+     * ================================================================== */
+    private View buildSettingsPage() {
+        android.widget.ScrollView sv = new android.widget.ScrollView(this);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(14);
+        col.setPadding(pad, pad, pad, dp(90));
+        sv.addView(col);
+
+        col.addView(section("Shizuku / Stellar（提权通道 · 真数据）"));
+        shzStatusTx = text("正在读取 Shizuku 状态…", 11, C_TEXT, false);
+        col.addView(shzStatusTx);
+        /* v9.62：横排里 btnTonal 是 MATCH_PARENT 宽 ⇒ 后两个被挤出屏幕 ✗ 改纵向堆叠 ✓ */
+        col.addView(btnTonal("申请授权（弹 Stellar 授权页）", v -> shzRequest()));
+        col.addView(btnTonal("刷新状态", v -> shzRefresh()));
+        col.addView(btnTonal("打开 Stellar 管理器", v -> openStellar()));
+        col.addView(text("授权后可用「测试 → ⑭ Shizuku/Stellar 探针」读取真实 GPU 频率/温度与 dumpsys ✓", 10, C_TEXT, false));
+
+        col.addView(section("渲染"));
+        col.addView(btnTonal("帧率上限：30fps / 不限（点击切换）", v -> {
+            fpsCap = !fpsCap;
+            toast("帧率上限：" + (fpsCap ? "30fps" : "不限"));
+            log("  帧率上限 -> " + (fpsCap ? "30fps" : "不限"));
+        }));
+        LinearLayout r2 = new LinearLayout(this);
+        r2.setOrientation(LinearLayout.HORIZONTAL);
+        for (final int sz : new int[] { 128, 192, 256, 384, 512, 768 }) {
+            Button b = btnTonal(sz + "²", v -> { litSize = sz; toast("默认画面尺寸：" + sz + "x" + sz + "（下次开始生效）"); log("  默认画面尺寸 -> " + sz); });
+            b.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            r2.addView(b);
+        }
+        col.addView(text("默认画面尺寸（点一下设定，下次开始渲染生效）", 10, C_TEXT, false));
+        col.addView(r2);
+
+        col.addView(section("维护"));
+        col.addView(btnTonal("清空日志（/sdcard/Download/gputest-last.log）", v -> {
+            try { new java.io.File("/sdcard/Download/gputest-last.log").delete(); toast("日志已清空"); }
+            catch (Throwable t) { toast("清空失败: " + t); }
+        }));
+        col.addView(btnTonal("导出日志", v -> exportLog()));
+
+        col.addView(section("关于"));
+        String info;
+        try {
+            android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+            info = "包名 " + getPackageName() + " · 版本 " + pi.versionName + " (" + pi.versionCode + ")"
+                 + "  |  设备 " + android.os.Build.MODEL + " · Android " + android.os.Build.VERSION.RELEASE
+                 + "  |  测试方式 直接 dlopen 驱动 .so（不经系统 loader），另有「原生 Vulkan（系统 loader）」可选 ✓";
+        } catch (Throwable t) { info = "版本信息读取失败: " + t; }
+        col.addView(text(info, 10, C_TEXT, false));
+
+        shzRefresh();
+        return sv;
+    }
+
+    static {
+        /* v9.56 · Java 未捕获异常记录器：此前只有原生信号会写文件 ⇒ Java 崩溃我完全看不到 ✗ */
+        try {
+            final java.io.File f = new java.io.File("/sdcard/Download/gputest_java_crash.txt");
+            Thread.setDefaultUncaughtExceptionHandler((t, e) -> {
+                try {
+                    java.io.FileWriter w = new java.io.FileWriter(f, true);
+                    w.write("=== " + new java.util.Date() + " | thread=" + t.getName() + " ===\n");
+                    w.write(e.toString() + "\n");
+                    for (StackTraceElement el : e.getStackTrace()) w.write("  at " + el + "\n");
+                    Throwable c = e.getCause();
+                    if (c != null) w.write("caused by: " + c + "\n");
+                    w.write("\n");
+                    w.close();
+                } catch (Throwable ignored) { }
+            });
+        } catch (Throwable ignored) { }
+    }
+
+    /* v9.62 · UI 优化第三刀 */
+    private void updateFab() {
+        if (fab == null) return;
+        String label; Runnable act;
+        if (curDest == DEST_OVERVIEW)    { label = "扫描驱动";   act = this::scanDrivers; }
+        else if (curDest == DEST_TEST)   { label = "一键全流程"; act = this::runAll; }
+        else if (curDest == DEST_RENDER) {
+            if (segRender == SEG_RENDER_STRESS)   { label = stressRunning ? "■ 停止压力" : "▶ 开始压力"; act = this::toggleStress; }
+            else if (segRender == SEG_RENDER_LIT) { label = litRunning ? "■ 停止光影" : "▶ 开始光影"; act = this::toggleLit; }
+            else                                  { label = renderRunning ? "■ 停止渲染" : "▶ 开始渲染"; act = this::toggleRender; }
+        } else                           { label = "导出日志";   act = this::exportLog; }
+        fab.setText(label);
+        fabAction = act;
+        fab.setVisibility(View.GONE);   /* v9.24: user asked to remove the floating bottom-right button on every page */
+        GradientDrawable g = new GradientDrawable();
+        g.setCornerRadius(dp(16));
+        g.setColor(c(C_TAB_ON_BG));
+        fab.setBackground(g);
+        fab.setTextColor(c(C_TAB_ON_TX));
+        textKeys.put(fab, C_TAB_ON_TX);
+    }
+
+    /** 页内二级分段（pill）：测试[驱动|校验|跑分|对比]、画面[实时渲染|压力]、记录[成绩|报告|日志]。 */
+    private View segmented(final int group, String[] labels, String[] icons, int selected) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setPadding(dp(12), dp(8), dp(12), dp(8));
+        segPills[group] = new TextView[labels.length];
+        for (int i = 0; i < labels.length; i++) {
+            final int idx = i;
+            TextView p = pill(labels[i], C_DIM, i == selected);
+            if (icons != null && icons.length > i) {
+                int id = drawableId(icons[i]);
+                if (id != 0) {
+                    android.graphics.drawable.Drawable d = getResources().getDrawable(id, null);
+                    d.setBounds(0, 0, dp(16), dp(16));
+                    p.setCompoundDrawables(d, null, null, null);
+                    p.setCompoundDrawablePadding(dp(6));
+                    try { p.setCompoundDrawableTintList(
+                            android.content.res.ColorStateList.valueOf(c(i == selected ? C_TAB_ON_TX : C_DIM))); }
+                    catch (Throwable ignored) { }
+                }
+            }
+            p.setOnClickListener(v -> {
+                if (group == 0)      selectDest(DEST_TEST, idx, true);
+                else if (group == 1) selectDest(DEST_RENDER, idx, true);
+                else                 selectDest(DEST_RECORDS, idx, true);
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.setMargins(0, 0, dp(8), 0);
+            p.setLayoutParams(lp);
+            segPills[group][i] = p;
+            row.addView(p);
+        }
+        return row;
+    }
+
+    private View hub(View seg, View[] pages, int sel) {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.addView(seg);
+        FrameLayout host = new FrameLayout(this);
+        for (int i = 0; i < pages.length; i++) {
+            pages[i].setVisibility(i == sel ? View.VISIBLE : View.GONE);
+            host.addView(pages[i], new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        }
+        col.addView(host, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        return col;
+    }
+
+    private View buildTestHubPage() {
+        hubTestPages = new View[] { buildDriverPage(), buildTestPage(), buildBenchPage(), buildComparePage() };
+        return hub(segmented(0, new String[] { "驱动", "校验", "跑分", "对比" },
+                new String[] { "ic_tab_driver", "ic_tab_test", "ic_tab_bench", "ic_tab_stress" }, segTest),
+                hubTestPages, segTest);
+    }
+
+    private View buildRenderHubPage() {
+        hubRenderPages = new View[] { buildPicturePage(), buildLitPage(), buildStressPage() };
+        return hub(segmented(1, new String[] { "实时渲染", "光影", "压力" },
+                new String[] { "ic_tab_render", "ic_tab_bench", "ic_tab_stress" }, segRender),
+                hubRenderPages, segRender);
+    }
+
+    private View buildRecordsHubPage() {
+        hubRecPages = new View[] { buildScoreboardPage(), buildReportPage(), buildLogPage() };
+        return hub(segmented(2, new String[] { "成绩", "报告", "日志" },
+                new String[] { "ic_tab_bench", "ic_tab_log", "ic_tab_log" }, segRec), hubRecPages, segRec);
+    }
+
+    /** ⑤ 搜索过滤：按文本命中显隐行（RadioButton 的文本是两行 Spannable ⇒ 直接 toString 匹配）。 */
+    private void filterGroup(RadioGroup g, String q) {
+        if (g == null) return;
+        for (int i = 0; i < g.getChildCount(); i++) {
+            View c = g.getChildAt(i);
+            boolean show = q.length() == 0
+                    || (c instanceof TextView && ((TextView) c).getText().toString()
+                            .toLowerCase(Locale.ROOT).contains(q));
+            c.setVisibility(show ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private void applySegments() {
+        View[][] hubs = { hubTestPages, hubRenderPages, hubRecPages };
+        int[] sels = { segTest, segRender, segRec };
+        for (int g = 0; g < hubs.length; g++) {
+            if (hubs[g] == null) continue;
+            for (int i = 0; i < hubs[g].length; i++)
+                hubs[g][i].setVisibility(i == sels[g] ? View.VISIBLE : View.GONE);
+            styleSegRow(g, sels[g]);
+        }
+        updateFab();
+    }
+
+    private void styleSegRow(int group, int sel) {
+        if (segPills[group] == null) return;
+        for (int i = 0; i < segPills[group].length; i++) {
+            TextView p = segPills[group][i];
+            if (p == null) continue;
+            boolean on = (i == sel);
+            stylePill(p, on);
+            int key = on ? C_TAB_ON_TX : C_DIM;
+            p.setTextColor(c(key));
+            textKeys.put(p, key);
+            try { p.setCompoundDrawableTintList(android.content.res.ColorStateList.valueOf(c(key))); }
+            catch (Throwable ignored) { }
+        }
+    }
+
+    /* ---- A/B 对比页 / 成绩页 / 报告页 ---- */
+    /* =========================================================================
+     *  v7.0 光影设置面板：阴影 / 画面效果 / 负载 / 调试 四组
+     *  布尔=Switch（带"它影响什么"的灰字）；离散=pill 分段；倍率=SeekBar 1..64
+     *  改动立即生效（nativeLitConfig）并回显原生摘要行；持久化 lit_* ✓
+     * ========================================================================= */
+    private View buildLitPage() {
+        LinearLayout col = col();
+        runSafe("光影设置回填", this::litLoadPrefs);
+        /* ★ 原来在 onCreate 里**同步调原生**（nativeLitSettings）⇒ 最可能的崩溃点；
+         *   改为界面就绪后 800ms 再调，并包保险 ✓ */
+        ui.postDelayed(() -> runSafe("光影原生初始化", () -> { litInitFromNative(); litRefreshSummary(); }), 800);
+
+        col.addView(rtBigCard());                   /* ★ 光追：顶部最醒目的大开关 */
+
+        litView = new ImageView(this);
+        litView.setAdjustViewBounds(true);
+        litView.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        litView.setBackgroundColor(c(C_RENDER_BG));
+        litStats = text("GPU 时间 — ｜ FPS — ｜ 占空比 —", 12, C_TEXT, false);
+        litStats.setTypeface(Typeface.MONOSPACE);
+        litNativeTx = text("", 11, C_TEXT, false);
+        litNativeTx.setTypeface(Typeface.MONOSPACE);
+        litNativeTx.setLineSpacing(0, 1.2f);
+        litNativeTx.setVisibility(View.GONE);
+        col.addView(card(section("光影画面（尺寸可调）"), litView, litStats, litNativeTx,
+                note("统计口径与跑分一致：GPU 时间取自时间戳，占空比 = GPU 时间 / 墙钟。"
+                   + "下面那行是原生 nativeLitFrame 的**原样返回**（成功绿 / 失败红）。")));
+        LinearLayout sizeRow = new LinearLayout(this);          /* v9.18：画面尺寸可调 */
+        sizeRow.setOrientation(LinearLayout.HORIZONTAL);
+        for (final int sz : new int[] { 128, 192, 256, 384, 512, 640, 768, 1024 })   /* v9.19：更多档位 ✓ */ {
+            sizeRow.addView(btnTonal(String.valueOf(sz), v -> {
+                litSize = sz;
+                setStatus("画面尺寸：" + sz + "×" + sz + "（下次开始生效）", C_NEUTRAL);
+                log("  画面尺寸 -> " + sz + "×" + sz);
+            }));
+        }
+        col.addView(sizeRow);
+        for (int i = 0; i < sizeRow.getChildCount(); i++) {          /* v9.21：① 等分宽度（原来 8 个 MATCH_PARENT
+                                                                     * 只显示第 1 个 ✗）② 从任务锁名单里摘出去 ⇒
+                                                                     * 渲染中也能点，不会被 setEnabled(false) 禁用 ✓ */
+            View c0 = sizeRow.getChildAt(i);
+            c0.setLayoutParams(new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            actionButtons.remove(c0);
+        }
+        shzRefresh();                                   /* 建页时自动读一次状态 ✓ */
+
+
+        m3dBtn = btnPrimary("▶ 迷你 3D（独立最简路径）", v -> toggleMini3D());   /* v9.14 */
+        col.addView(m3dBtn);
+        actionButtons.remove(m3dBtn);
+        rt3dBtn = btnPrimary("▶ 光追 3D（硬件 RT · ray query）", v -> toggleRt3D());   /* v9.22 */
+        col.addView(rt3dBtn);
+        actionButtons.remove(rt3dBtn);                              /* 同样免疫任务锁 ⇒ 随时能停 ✓ */                               /* v9.21 ★ 真凶：claim() 会把 actionButtons 里所有按钮
+                                                                     * setEnabled(false)，而停止按钮也在名单里 ⇒ 一旦渲染开始，
+                                                                     * 停止按钮自己就被禁用了 ⇒ 点它不触发 onClick、日志一条都没有 ✗
+                                                                     * 控制按钮必须免疫任务锁 ✓ */   /* v9.11：全新最简 GPU 场景，用于判断 GPU 路径本身能不能出画 ✓ */
+
+        litSummary = text("（原生摘要未接入时显示本地记录）", 11, C_TEXT, false);
+        litSummary.setTypeface(Typeface.MONOSPACE);
+        litSummary.setLineSpacing(0, 1.2f);
+        col.addView(card(section("当前配置（原生摘要）"), litSummary));
+
+        LinearLayout shadowGroup = new LinearLayout(this);
+        shadowGroup.setOrientation(LinearLayout.VERTICAL);
+        shadowGroup.addView(section("阴影"));
+        shadowGroup.addView(litSwitch("shadows", "阴影", "开：逐帧渲一张阴影深度图并采样；关：只画直射光（快很多）", litShadows));
+        shadowGroup.addView(litPills("pcf", "PCF 质量", new int[] { 1, 3, 5 },
+                new String[] { "1（硬边）", "3×3", "5×5" }, litPcf,
+                "每轴采样数：1 = 硬边阴影，3 = 3×3 软阴影，5 = 5×5 更软（越软越贵）"));
+        shadowGroup.addView(litPills("shadowRes", "阴影贴图分辨率", new int[] { 1024, 2048, 4096 },
+                new String[] { "1024²", "2048²", "4096²" }, litRes,
+                "深度图分辨率：越大阴影越锐利，显存与带宽占用越高"));
+        col.addView(card(shadowGroup));
+
+        LinearLayout fxGroup = new LinearLayout(this);
+        fxGroup.setOrientation(LinearLayout.VERTICAL);
+        fxGroup.addView(section("画面效果"));
+        fxGroup.addView(litSwitch("bloom", "泛光（Bloom）",
+                "亮部溢出到周边：多一遍降采样+模糊+叠加，影响观感与带宽（3D 场景已生效 · 原生光影待接线）", litBloom));
+        fxGroup.addView(litSwitch("tonemap", "色调映射 + 伽马",
+                "关掉看到线性原始值（偏暗），打开才是最终观感；逐帧比对时可关（3D 场景已生效 · 原生光影待接线）", litTonemap));
+        fxGroup.addView(litSwitch("animate", "动画（随时间变化）",
+                "关掉画面静止 ⇒ 便于逐帧逐像素比对正确性（3D 场景已生效 · 原生光影待接线）", litAnimate));
+        col.addView(card(fxGroup));
+
+        LinearLayout loadGroup = new LinearLayout(this);
+        loadGroup.setOrientation(LinearLayout.VERTICAL);
+        loadGroup.addView(section("负载"));
+        loadGroup.addView(litPills("cubes", "立方体实例数", new int[] { 16, 36, 100, 400 },
+                new String[] { "16", "36", "100", "400" }, litCubes,
+                "几何负载阶梯：实例越多，顶点/绘制调用与阴影图负担越高"));
+        TextView passLbl = text("每帧光照 pass 倍率（负载放大器）", 14, C_TEXT, true);
+        passLbl.setPadding(0, dp(10), 0, dp(2));
+        loadGroup.addView(passLbl);
+        litPassBar = new SeekBar(this);
+        litPassBar.setMax(63);
+        litPassBar.setProgress(Math.max(1, litPasses) - 1);
+        litPassTx = text("passes = " + litPasses, 12, C_ACCENT, false);
+        litPassTx.setTypeface(Typeface.MONOSPACE);
+        litPassBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar b, int prog, boolean fromUser) {
+                litPasses = prog + 1;
+                if (litPassTx != null) litPassTx.setText("passes = " + litPasses);
+                if (fromUser) litApply("passes", litPasses);
+            }
+            @Override public void onStartTrackingTouch(SeekBar b) { }
+            @Override public void onStopTrackingTouch(SeekBar b) { }
+        });
+        loadGroup.addView(litPassBar);
+        loadGroup.addView(litPassTx);
+        loadGroup.addView(note("1 = 正常；调大后每帧重复跑同样多的光照 pass（1..64）⇒ 压出 GPU 时间差"
+                + "（3D 场景已生效 · 原生光影待接线）"));
+        col.addView(card(loadGroup));
+
+        LinearLayout dbgGroup = new LinearLayout(this);
+        dbgGroup.setOrientation(LinearLayout.VERTICAL);
+        dbgGroup.addView(section("调试"));
+        dbgGroup.addView(litPills("debugView", "调试视图", new int[] { 0, 1, 2 },
+                new String[] { "最终画面", "阴影贴图", "法线" }, litDebug,
+                "正确性自检：直接看中间结果（阴影深度图 / 法线），而不是只看最终画面（仅原生光影有此视图，3D 场景暂无）"));
+        col.addView(card(dbgGroup));
+
+        col.addView(card(section("恢复"),
+                btnTonal("重置默认（阴影开 · PCF 3 · 2048² · 36 个 · 泛光开 · 色调映射开 · 倍率 1 · 最终视图 · 动画开）",
+                        v -> litResetDefaults())));
+
+        /* 摘要由上面的 postDelayed 填（不在这里同步调原生 ✓） */
+        return scroll(col);
+    }
+
+    /** ★ 光追大卡：比其它卡片大一号 + 2dp 主色描边（用户要的"大选项"）。 */
+    private View rtBigCard() {
+        rtCardBox = new LinearLayout(this);
+        rtCardBox.setOrientation(LinearLayout.VERTICAL);
+        rtCardBox.setBackground(rtBigCardBg());
+        int p = dp(18);
+        rtCardBox.setPadding(p, p, p, p);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, dp(6), 0, dp(6));
+        rtCardBox.setLayoutParams(lp);
+
+        TextView title = text("光追（Ray Tracing）", 18, C_ACCENT, true);   /* 18sp：比卡片标题(16)大一号 */
+        rtCardBox.addView(title);
+        rtCardBox.addView(note("硬件加速的光线追踪。**能不能开取决于当前驱动**——"
+                + "探测结果会原样贴出来，不支持就明说，绝不用软件假装 ✓"));
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.addView(text("开启光追", 16, C_TEXT, true),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        rtSwitch = new android.widget.Switch(this);
+        rtSwitch.setChecked(rtOn != 0);
+        rtSwitch.setScaleX(1.15f); rtSwitch.setScaleY(1.15f);              /* 触控/视觉都更大一号 */
+        row.addView(rtSwitch);
+        rtCardBox.addView(row);
+        fluid(row);
+
+        rtVerdictTx = text(rtOn != 0 ? "（正在探测…）" : "（开关打开后会立刻探测该驱动的光追能力）", 13, C_DIM, true);
+        rtVerdictTx.setPadding(0, dp(6), 0, dp(2));
+        rtCardBox.addView(rtVerdictTx);
+
+        rtProbeTx = text("", 11, C_TEXT, false);
+        rtProbeTx.setTypeface(Typeface.MONOSPACE);
+        rtProbeTx.setLineSpacing(0, 1.2f);
+        rtProbeTx.setVisibility(View.GONE);
+        rtCardBox.addView(rtProbeTx);
+
+        rtView = new ImageView(this);
+        rtView.setAdjustViewBounds(true);
+        rtView.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+        rtView.setBackgroundColor(c(C_RENDER_BG));
+        rtView.setVisibility(View.GONE);
+        rtCardBox.addView(rtView);
+
+        rtRunBtn = btnPrimary("开始光追渲染（硬件）", v -> rtRunToggle());
+        rtRunBtn.setEnabled(false);                          /* 只有探测到"支持硬件光追"才可点 ✓ */
+        rtCardBox.addView(rtRunBtn);
+
+        rtInitTx = text("", 11, C_TEXT, false);              /* nativeRtInit 返回行：等宽、原样 ✓ */
+        rtInitTx.setTypeface(Typeface.MONOSPACE);
+        rtInitTx.setLineSpacing(0, 1.2f);
+        rtInitTx.setVisibility(View.GONE);
+        rtCardBox.addView(rtInitTx);
+
+        rtCpuBtn = btnTonal("CPU 光追参考图", v -> {
+            if (busy) { toast("测试进行中，稍后再点"); return; }
+            log("  ⏸ CPU 光追参考图：nativeCpuRtRender/nativeCpuRtBlit 尚未导出 ⇒ 本按钮先占位 ✓");
+            if (rtInitTx != null) {
+                rtInitTx.setVisibility(View.VISIBLE);
+                rtInitTx.setText("CPU 光追参考图将在下版接入（逐像素光线求交，结果会明确标注「非硬件光追」）");
+                rtInitTx.setTextColor(c(C_WARN));
+            }
+            toast("CPU 光追参考图将在下版接入");
+        });
+        rtCardBox.addView(rtCpuBtn);
+
+        rtCardBox.addView(note("本机 GPU（Immortalis-G720）硬件支持光追；但能不能真跑取决于当前驱动 —— "
+                + "系统驱动（Mali 闭源）报告支持 ray_query ✓，PanVK（Mesa）报告不支持 ✗。"
+                + "探测结果以驱动自报为准，我们不做任何假装。"));
+
+        rtSwitch.setOnCheckedChangeListener((b, checked) -> {
+            int v = checked ? 1 : 0;
+            if (busy) {                                     /* 硬约束：测试/跑分中不改这个开关 */
+                b.setChecked(rtOn != 0);
+                toast("测试进行中，稍后再改光追开关");
+                return;
+            }
+            rtOn = v;
+            rtPersist(v);
+            if (v == 1) rtProbeStart();
+            else {
+                rtVerdictTx.setText("已关闭光追开关（探测结果保留在下方）");
+                rtVerdictTx.setTextColor(c(C_DIM));
+                rtRunBtn.setEnabled(false);
+            }
+        });
+        if (rtOn != 0)                                       /* ★ 开机自动探测：延后 + 包保险 ✓ */
+            ui.postDelayed(() -> runSafe("开机光追探测", this::rtProbeStart), 1500);
+        return rtCardBox;
+    }
+
+    private android.graphics.drawable.Drawable rtBigCardBg() {
+        GradientDrawable g = new GradientDrawable();
+        g.setCornerRadius(dp(x(0) + 4));                     /* ColorOS 主题下 24dp，其余 16dp */
+        g.setColor(withAlpha(c(C_CARD), x(3)));
+        g.setStroke(dp(2), c(C_ACCENT));                     /* 2dp 主色描边 ⇒ 一眼看出是"大选项" */
+        return g;
+    }
+
+    /** 持久化：key **lit_raytracing** ✓（不喂给 nativeLitConfig，因为键表里没有它） */
+    private void rtPersist(int v) {
+        try { getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt("lit_raytracing", v).apply(); }
+        catch (Throwable t) { android.util.Log.w("gputest", "光追开关持久化失败: " + t); }
+        log("  光追开关 = " + v + "（lit_raytracing 已保存）");
+    }
+
+    /** 打开时跑 nativeRtProbe(当前驱动)，**原样**显示四行 + 结论，并据此决定三态 ✓ */
+    /**
+     * ★ 光追渲染循环（与画面页同构）：一帧 = nativeRtFrame() → 拷进 Bitmap → 乒乓显示。
+     * 停法：① 用户点"■ 停止光追" ② 原生返回 `X …`（失败即停，**保留最后一帧**）
+     *      ③ 离开【画面】/切分段/onStop/onDestroy ④ 进程结束
+     * 每 30 帧 progressToken++ ⇒ 看门狗有进展就不误报 ✓；UI 线程绝不 join ✓
+     */
+    private void rtLoop() {
+        int buf = 1;
+        try {
+            while (rtRunning) {
+                String s;
+                try { s = nativeRtFrame(); }
+                catch (Throwable t) { s = "X nativeRtFrame 不可用: " + t; }
+                final String line = s == null ? "（无返回）" : s.trim();
+                final boolean bad = line.startsWith("X ");
+                if (rtInitTx != null) {
+                    final String show = line + (bad ? "\n（这一帧保留便于诊断 ✓）" : "");
+                    ui.post(() -> { rtInitTx.setText(show); rtInitTx.setTextColor(c(bad ? C_BAD : C_OK)); });
+                }
+                if (bad) { logBlock("光追失败（保留最后一帧）", line); setStatus("光追失败：见卡片原文", C_BAD); break; }
+                try {
+                    String e = nativeRtBlit(rtBufs[buf]);
+                    if (e != null && e.trim().startsWith("X ")) { logBlock("光追回读失败", e.trim()); break; }
+                } catch (Throwable t) { log("  ✗ nativeRtBlit 不可用: " + t); break; }
+                final Bitmap target = rtBufs[buf];
+                buf ^= 1; rtFrames++;
+                if (rtFrames % 30 == 0) progressToken++;                  /* 有进展 ⇒ 看门狗静默续期 ✓ */
+                final int fr = rtFrames;
+                ui.post(() -> {
+                    if (rtView != null) { rtView.setImageBitmap(target); rtView.invalidate(); }
+                    if (fr == 1) setStatus("光追：渲染中（硬件）", C_OK);
+                });
+            }
+        } finally {
+            final int n = rtFrames;
+            rtRunning = false;
+            try { nativeRtStop(); } catch (Throwable ignored) { }        /* 安全可调用 ✓ */
+            rtState = 0;
+            ui.post(() -> {
+                if (rtRunBtn != null) { rtRunBtn.setText("开始光追渲染（硬件）"); rtRunBtn.setEnabled(true); }
+                setStatus("光追已停止（共 " + n + " 帧，最后一帧保留）", C_NEUTRAL);
+            });
+            log("  光追循环结束：帧数 " + n + "（最后一帧保留 ✓）");
+            endTask(); release();
+        }
+    }
+
+    /** ② 停止：置标志（循环自己收尾）⇒ 后台 join + nativeRtStop，**不在 UI 线程 join** ✓ */
+    private void stopRt(String why) {
+        if (!rtRunning && rtThread == null) return;
+        rtRunning = false;
+        final Thread t = rtThread;
+        rtThread = null;
+        setStatus("光追：正在停止（" + why + "）", C_WARN);
+        new Thread(() -> {
+            if (t != null) { try { t.join(2500); } catch (InterruptedException ignored) { } }
+            try { nativeRtStop(); } catch (Throwable ignored) { }
+            ui.post(() -> {
+                if (rtRunBtn != null) { rtRunBtn.setText("开始光追渲染（硬件）"); rtRunBtn.setEnabled(true); }
+            });
+            setStatus("光追已停止（" + why + "）· 最后一帧保留", C_NEUTRAL);
+            log("  光追已停止：" + why);
+            endTask(); release();
+        }, "gpu-rt-stop").start();
+    }
+
+    /** ① 开始/停止光追：真调 nativeRtInit（工作线程），成功后起渲染循环。 */
+    private void rtRunToggle() {
+        if (busy) { toast("测试进行中，稍后再点"); return; }
+        if (rtState == 1) { stopRt("手动停止"); return; }          /* ② 真停：置标志 + 后台 nativeRtStop ✓ */
+        final String p = selectedPath();
+        if (p == null) { toast("先在「测试 → 驱动」选一个驱动"); return; }
+        if (!claim("光追渲染")) return;                             /* busy：与其它原生任务互斥 ✓ */
+        rtRunBtn.setEnabled(false);
+        rtRunBtn.setText("正在建 BLAS…");
+        if (rtInitTx != null) {
+            rtInitTx.setVisibility(View.VISIBLE);
+            rtInitTx.setText("正在 nativeRtInit(" + new File(p).getName() + ", 512, 512) …");
+            rtInitTx.setTextColor(c(C_WARN));
+        }
+        new Thread(() -> {
+            String out = null;
+            try { out = nativeRtInit(p, 512, 512); }
+            catch (Throwable t) { out = null; log("  ⚠ nativeRtInit 不可用: " + t); }
+            final String o = out;
+            ui.post(() -> rtShowInit(o));
+        }, "rt-init").start();
+    }
+
+    /** ② 原生返回**原样**显示：成功 ⇒ ■ 停止光追 + "BLAS 已建，渲染帧接口待接入"；失败 ⇒ 原因原样 + 按钮复位 ✓ */
+    private void rtShowInit(String out) {
+        if (out == null || out.trim().length() == 0) {
+            if (rtInitTx != null) {
+                rtInitTx.setVisibility(View.VISIBLE);
+                rtInitTx.setText("光追初始化接口未接入（等原生 nativeRtInit 导出）");
+                rtInitTx.setTextColor(c(C_WARN));
+            }
+            rtRunBtn.setText("开始光追渲染（硬件）");
+            rtRunBtn.setEnabled(false);
+            return;
+        }
+        final String t = out.trim();
+        if (rtInitTx != null) rtInitTx.setVisibility(View.VISIBLE);
+        boolean okInit = t.contains("光追就绪") || t.contains("BLAS 已建");
+        if (okInit) {
+            rtState = 1;
+            if (rtInitTx != null) {
+                rtInitTx.setText(t + "\nBLAS 已建 ⇒ 启动光追渲染循环 ✓（硬件光追）");
+                rtInitTx.setTextColor(c(C_OK));
+            }
+            rtRunBtn.setText("■ 停止光追");
+            rtRunBtn.setEnabled(true);
+            setStatus("光追：BLAS 已建 ✓ 渲染中", C_OK);
+            if (rtView != null) rtView.setVisibility(View.VISIBLE);
+            for (int i = 0; i < 2; i++)                              /* 512×512 ARGB_8888，与 Init 一致 ✓ */
+                if (rtBufs[i] == null) rtBufs[i] = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888);
+            rtFrames = 0;
+            rtRunning = true;
+            rtThread = new Thread(this::rtLoop, "gpu-rt");
+            rtThread.start();
+        } else {
+            rtState = 0;
+            if (rtInitTx != null) { rtInitTx.setText(t); rtInitTx.setTextColor(c(C_BAD)); }   /* 为什么不行 ⇒ 原样 ✓ */
+            rtRunBtn.setText("开始光追渲染（硬件）");
+            rtRunBtn.setEnabled(true);                                                       /* 复位 ⇒ 可重试 ✓ */
+            setStatus("光追：初始化失败（原因见卡片）", C_BAD);
+            release();                                                                       /* init 失败：把 busy 还回去 ✓ */
+        }
+        logBlock("光追初始化", t);
+    }
+
+    private void rtProbeStart() {
+        final String p = selectedPath();
+        if (p == null) {
+            rtVerdictTx.setText("驱动不可用，无法探测光追");
+            rtVerdictTx.setTextColor(c(C_BAD));
+            rtProbeTx.setVisibility(View.GONE);
+            rtRunBtn.setEnabled(false);
+            return;
+        }
+        if (rtProbing) return;
+        rtProbing = true;
+        rtVerdictTx.setText("（正在探测：" + new File(p).getName() + " …）");
+        rtVerdictTx.setTextColor(c(C_WARN));
+        new Thread(() -> {
+            String probe = null;
+            try { probe = nativeRtProbe(p); }
+            catch (Throwable t) { probe = null; log("  ⚠ nativeRtProbe 不可用: " + t); }
+            final String pr = probe;
+            ui.post(() -> runSafe("光追探测显示", () -> rtShowProbe(pr)));
+            rtProbing = false;
+        }, "rt-probe").start();
+    }
+
+    private void rtShowProbe(String probe) {
+        if (rtProbeTx == null) return;
+        if (probe == null || probe.trim().length() == 0) {
+            rtVerdictTx.setText("光追探测接口未接入（等原生）—— 开关状态已保存");
+            rtVerdictTx.setTextColor(c(C_WARN));
+            rtProbeTx.setVisibility(View.GONE);
+            rtRunBtn.setEnabled(false);
+            return;
+        }
+        rtProbeTx.setText(probe.trim());
+        rtProbeTx.setVisibility(View.VISIBLE);
+        String low = probe.toLowerCase(Locale.ROOT);
+        boolean supported = probe.contains("✅") || probe.contains("硬件光追可用")
+                || (probe.contains("支持硬件光追") && !probe.contains("不支持硬件光追"));
+        if (supported) {                                     /* ① 支持 ⇒ 可用 + 可点开始 */
+            rtVerdictTx.setText("✅ 硬件光追可用 —— 可以真跑");
+            rtVerdictTx.setTextColor(c(C_OK));
+            rtRunBtn.setEnabled(true);
+            rtRunBtn.setText("开始光追渲染（硬件）");
+        } else if (probe.contains("不支持") || low.contains("无 ✗") || low.contains("= 无")) {
+            rtVerdictTx.setText("⚠ 该驱动不支持硬件光追 ⇒ 将使用「CPU 光追参考图」"
+                    + "（结果会明确标注**非硬件光追**）");
+            rtVerdictTx.setTextColor(c(C_WARN));
+            rtRunBtn.setEnabled(false);
+            rtRunBtn.setText("开始光追渲染（硬件·当前驱动不支持）");
+        } else {
+            rtVerdictTx.setText("⚠ 探测结果无法判定 ⇒ 按「不支持硬件光追」处理（不假装）");
+            rtVerdictTx.setTextColor(c(C_WARN));
+            rtRunBtn.setEnabled(false);
+            rtRunBtn.setText("开始光追渲染（硬件·当前驱动不支持）");
+        }
+        logBlock("光追探测", probe);
+    }
+
+    private View litSwitch(final String key, String title, String why, int cur) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.addView(text(title, 14, C_TEXT, true),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        android.widget.Switch sw = new android.widget.Switch(this);
+        sw.setChecked(cur != 0);
+        row.addView(sw);
+        box.addView(row);
+        box.addView(note(why));
+        sw.setOnCheckedChangeListener((b, checked) -> {
+            int v = checked ? 1 : 0;
+            if ("shadows".equals(key)) litShadows = v;
+            else if ("bloom".equals(key)) litBloom = v;
+            else if ("tonemap".equals(key)) litTonemap = v;
+            else if ("animate".equals(key)) litAnimate = v;
+            litApply(key, v);
+        });
+        fluid(row);
+        return box;
+    }
+
+    private View litPills(final String key, String title, final int[] vals, String[] labels, int cur, String why) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        TextView t = text(title, 14, C_TEXT, true);
+        t.setPadding(0, dp(10), 0, dp(2));
+        box.addView(t);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        TextView[] pills = new TextView[vals.length];
+        int sel = 0;
+        for (int i = 0; i < vals.length; i++) if (vals[i] == cur) sel = i;
+        final LitRow lr = new LitRow(key, vals, labels, pills, sel);
+        for (int i = 0; i < labels.length; i++) {
+            final int idx = i;
+            TextView pl = pill(labels[i], C_DIM, i == sel);
+            pl.setOnClickListener(v -> {
+                lr.sel = idx;
+                styleLitRow(lr);
+                litSetVal(lr.key, lr.vals[idx]);
+                litApply(lr.key, lr.vals[idx]);
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.setMargins(0, 0, dp(8), 0);
+            pl.setLayoutParams(lp);
+            pills[i] = pl;
+            row.addView(pl);
+        }
+        litRows.add(lr);
+        box.addView(row);
+        box.addView(note(why));
+        return box;
+    }
+
+    private void styleLitRow(LitRow r) {
+        for (int i = 0; i < r.pills.length; i++) {
+            boolean on = (i == r.sel);
+            stylePill(r.pills[i], on);
+            int key = on ? C_TAB_ON_TX : C_DIM;
+            r.pills[i].setTextColor(c(key));
+            textKeys.put(r.pills[i], key);
+        }
+    }
+
+    private void litSetVal(String key, int v) {
+        if ("pcf".equals(key)) litPcf = v;
+        else if ("shadowRes".equals(key)) litRes = v;
+        else if ("cubes".equals(key)) litCubes = v;
+        else if ("debugView".equals(key)) litDebug = v;
+    }
+
+    private void litApply(String key, int val) {
+        try { getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt("lit_" + key, val).apply(); }
+        catch (Throwable t) { android.util.Log.w("gputest", "光影持久化失败: " + t); }
+        String sum = null;
+        try { sum = nativeLitConfig(key, val); } catch (Throwable t) { sum = null; }
+        if (litSummary != null)
+            litSummary.setText(sum != null && sum.length() > 0 ? sum
+                    : "（原生光影接口未接入 ⇒ 仅本地记录：" + key + "=" + val + "，接入后自动生效）");
+        log("  光影设置 " + key + " = " + val + (sum != null ? "  → " + sum : "（原生未接入）"));
+        try { nativeMini3DSettings(litShadows, litPcf, litRes, litBloom, litTonemap, litAnimate, litPasses); } catch (Throwable t2) { }
+    }
+
+    private void litRefreshSummary() {
+        try {
+            String sum = nativeLitConfig("shadows", litShadows);
+            if (litSummary != null && sum != null && sum.length() > 0) litSummary.setText(sum);
+        } catch (Throwable ignored) { }
+    }
+
+    private void litLoadPrefs() {
+        try {
+            android.content.SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+            litShadows = sp.getInt("lit_shadows", litShadows);
+            litPcf     = sp.getInt("lit_pcf", litPcf);
+            litRes     = sp.getInt("lit_shadowRes", litRes);
+            litCubes   = sp.getInt("lit_cubes", litCubes);
+            litBloom   = sp.getInt("lit_bloom", litBloom);
+            litTonemap = sp.getInt("lit_tonemap", litTonemap);
+            litPasses  = sp.getInt("lit_passes", litPasses);
+            litDebug   = sp.getInt("lit_debugView", litDebug);
+            litAnimate = sp.getInt("lit_animate", litAnimate);
+            rtOn       = sp.getInt("lit_raytracing", rtOn);        /* 光追开关 ✓ */
+        } catch (Throwable t) { android.util.Log.w("gputest", "读取光影设置失败: " + t); }
+    }
+
+    private void litInitFromNative() {
+        try {
+            String csv = nativeLitSettings();
+            if (csv == null) return;
+            String[] q = csv.trim().split("\\s*,\\s*");
+            if (q.length < 9) return;
+            android.content.SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+            if (!sp.contains("lit_shadows"))   litShadows = Integer.parseInt(q[0].trim());
+            if (!sp.contains("lit_pcf"))       litPcf     = Integer.parseInt(q[1].trim());
+            if (!sp.contains("lit_shadowRes")) litRes     = Integer.parseInt(q[2].trim());
+            if (!sp.contains("lit_cubes"))     litCubes   = Integer.parseInt(q[3].trim());
+            if (!sp.contains("lit_bloom"))     litBloom   = Integer.parseInt(q[4].trim());
+            if (!sp.contains("lit_tonemap"))   litTonemap = Integer.parseInt(q[5].trim());
+            if (!sp.contains("lit_passes"))    litPasses  = Integer.parseInt(q[6].trim());
+            if (!sp.contains("lit_debugView")) litDebug   = Integer.parseInt(q[7].trim());
+            if (!sp.contains("lit_animate"))   litAnimate = Integer.parseInt(q[8].trim());
+        } catch (Throwable t) { /* 未接入 ⇒ 用默认值 ✓ */ }
+    }
+
+    private void litResetDefaults() {
+        litShadows = 1; litPcf = 3; litRes = 2048; litCubes = 36;
+        litBloom = 1; litTonemap = 1; litPasses = 1; litDebug = 0; litAnimate = 1;
+        litApply("shadows", 1);    litApply("pcf", 3);       litApply("shadowRes", 2048);
+        litApply("cubes", 36);     litApply("bloom", 1);     litApply("tonemap", 1);
+        litApply("passes", 1);     litApply("debugView", 0); litApply("animate", 1);
+        if (litPassBar != null) litPassBar.setProgress(0);
+        if (litPassTx != null) litPassTx.setText("passes = 1");
+        toast("光影设置已重置为默认");
+    }
+
+    private void toggleLit() { if (litRunning) stopLit("手动停止"); else startLit(); }
+
+    private void startLit() {
+        final String p = selectedPath();
+        if (p == null) { toast("先在「测试 → 驱动」选一个驱动"); return; }
+        if (litRunning) return;
+        if (!claim("光影渲染")) return;
+        litRunning = true; updateFab();
+        setStatus("光影：初始化中…", C_WARN);
+        beginTask("光影预览");
+        new Thread(() -> {
+            try {
+                String staged = stageDriver(p);
+                if (staged == null) { setStatus("光影：暂存驱动失败", C_BAD); }
+                else {
+                    try {
+                        String initOut = nativeLitInit(staged, litSize, litSize);
+                        logBlock("litInit", initOut);
+                        litShowNative(initOut, initOut != null && initOut.contains("光影就绪"));
+                    } catch (Throwable t) {
+                        log("  ⚠ nativeLitInit 不可用: " + t);
+                        litShowNative("X nativeLitInit 不可用: " + t, false);
+                        setStatus("光影：原生接口未接入", C_WARN);
+                        throw t;
+                    }
+                    for (int i = 0; i < 2; i++)
+                        if (litBufs[i] == null) litBufs[i] = Bitmap.createBitmap(litSize, litSize, Bitmap.Config.ARGB_8888);
+                    ui.post(() -> { if (litView != null) litView.setImageBitmap(litBufs[0]); });
+                    setStatus("光影：运行中（可实时改开关）", C_OK);
+                    litThread = new Thread(this::litLoop, "gpu-lit");
+                    litThread.start();
+                    return;                              /* 循环线程接管 ⇒ 此处不 release */
+                }
+            } catch (Throwable t) {
+                log("  ✗ 光影启动失败: " + t);
+            }
+            litRunning = false;
+            endTask(); release();
+            ui.post(this::updateFab);
+        }, "gpu-lit-init").start();
+    }
+
+    /** 把原生返回行**原样**贴到面板（成功绿 / 失败红）✓ */
+
+    /* v9.18：UI 贴图合并 —— 渲染线程每帧都 post(setImageBitmap+setText) 会把主线程刷爆，
+     * 点击事件排在几千个贴图任务之后 ⇒ 所有「停止」按钮看起来都失灵 ✗
+     * 现在同一时刻只允许一个贴图任务排队，多余的帧直接丢弃（画面照样连续）✓ */
+    private volatile long uiLastMs = 0;                          /* v9.19：上次真正贴图的时间 */
+    private void postFrame(Runnable r) {
+        long now = System.currentTimeMillis();
+        if (now - uiLastMs < 70) return;                         /* v9.19：UI 更新限到 ~14fps —— 只合并不够，
+                                                                  * 主线程仍被 ~60fps 的 512² 贴图占满 ⇒ 触摸事件挤不进去，
+                                                                  * 停止按钮因此完全没反应 ✗ 现在把主线程腾出来 ✓ */
+        uiLastMs = now;
+        if (!uiPending.compareAndSet(false, true)) return;
+        ui.post(() -> { try {
+            if (!busy) for (Button b : actionButtons) if (b != null && !b.isEnabled()) b.setEnabled(true);   /* v9.21：自愈 ——
+                * 万一某条失败路径漏了 release()，按钮不会被永久禁用（这正是你遇到的整页点不动）✓ */
+            r.run();
+        } finally { uiPending.set(false); } });
+    }
+
+    /* ==========================================================================
+     * v9.11 · 迷你 3D（独立最简路径）—— 自转立方体
+     * 与光影/光追完全独立：自己的上下文、图像、管线、命令池、回读缓冲。
+     * 用来判定「GPU 路径本身能不能出画」：它出图 ⇒ 复杂管线的问题；它也不出 ⇒ 回显层的问题。
+     * ========================================================================== */
+    private void toggleMini3D() {
+        if (m3dRunning) { log("  ▶ 收到「停止迷你3D」点击（v9.19 探针）"); m3dRunning = false; setStatus("迷你3D：停止中…", C_WARN); if (m3dBtn != null) m3dBtn.setText("▶ 迷你 3D（独立最简路径）"); return; }
+        final String p = selectedPath();
+        if (p == null) { toast("先在「测试 → 驱动」选一个驱动"); return; }
+        if (!claim("迷你3D")) return;
+        m3dRunning = true;
+        if (m3dBtn != null) m3dBtn.setText("■ 停止迷你 3D");   /* v9.14：给用户一个明确的停止入口 ✓ */
+        setStatus("迷你3D：初始化中…", C_WARN);
+        new Thread(() -> {
+            try {
+                String staged = stageDriver(p);
+                if (staged == null) { setStatus("迷你3D：暂存驱动失败", C_BAD); }
+                else {
+                    int r = nativeMini3DInit(staged, litSize, litSize);
+                    log("  mini3D init -> " + r);
+                    if (r == 0) { litShowNative("X 迷你3D 初始化失败（看日志）", false); setStatus("迷你3D：初始化失败（看日志）", C_BAD); }
+                    else {
+                        setStatus("迷你3D：运行中（独立路径 · 自转立方体）", C_OK);   /* v9.13 修：原先成功后不更新状态 ⇒ UI 永远停在初始化中 ✗ */
+                        for (int i = 0; i < 2; i++) if (litBufs[i] == null) litBufs[i] = Bitmap.createBitmap(litSize, litSize, Bitmap.Config.ARGB_8888);
+                        /* v9.17 修正：自检图必须**可变** —— Bitmap.createBitmap(int[],…) 返回的是不可变位图，
+                         * 会让 AndroidBitmap_lockPixels 失败 ⇒ 双缓冲里那一半永远停在自检渐变色 ⇒ 画面一闪一闪 ✗
+                         * 自检的使命（证明显示层可用）已经完成，这里直接去掉，改成两块干净的**可变**位图 ✓ */
+                        for (int i2 = 0; i2 < 2; i2++) {
+                            litBufs[i2] = Bitmap.createBitmap(litSize, litSize, Bitmap.Config.ARGB_8888);
+                            litBufs[i2].eraseColor(0xFF101820);
+                        }
+                        mini3dLoop();
+                    }
+                }
+            } catch (Throwable t) { log("  ✗ 迷你3D 异常: " + t); }
+            m3dRunning = false;
+            endTask(); release();
+            ui.post(this::updateFab);
+        }, "mini3d-init").start();
+    }
+
+    /* ==========================================================================
+     * v9.22 · 硬件光追接入 3D 测试
+     *   复用同一套已验证的显示路径（nativeXxxFrame → Blit 进 Bitmap → litView 乒乓显示），
+     *   只把渲染换成硬件 ray query（BLAS/TLAS + compute）。探测/初始化/每帧返回**原样进日志** ✓
+     * ========================================================================== */
+    private void toggleRt3D() {
+        if (rt3dRunning) { log("  ▶ 收到「停止光追3D」点击"); rt3dRunning = false; setStatus("光追3D：停止中…", C_WARN);
+                           if (rt3dBtn != null) rt3dBtn.setText("▶ 光追 3D（硬件 RT · ray query）"); return; }
+        final String p = selectedPath();
+        if (p == null) { toast("先在「测试 → 驱动」选一个驱动"); return; }
+        if (!claim("光追3D")) return;
+        rt3dRunning = true;
+        if (rt3dBtn != null) rt3dBtn.setText("■ 停止光追 3D");
+        setStatus("光追3D：探测扩展…", C_WARN);
+        new Thread(() -> {
+            try {
+                String probe;
+                try { probe = nativeRtProbe(p); } catch (Throwable t) { probe = "X nativeRtProbe: " + t; }
+                logBlock("光追扩展探测", probe);                     /* 原样 ⇒ 支不支持、缺哪个扩展，日志里直接看 ✓ */
+                String init;
+                try { init = nativeRtInit(p, litSize, litSize); } catch (Throwable t) { init = "X nativeRtInit: " + t; }
+                logBlock("光追3D 初始化", init);
+                litShowNative(init, init != null && !init.trim().startsWith("X "));
+                if (init == null || init.trim().startsWith("X ")) { rt3dRunning = false; }
+                else {
+                    for (int i = 0; i < 2; i++) { litBufs[i] = Bitmap.createBitmap(litSize, litSize, Bitmap.Config.ARGB_8888); litBufs[i].eraseColor(0xFF101820); }
+                    rt3dLoop();
+                }
+            } catch (Throwable t) { log("  ✗ 光追3D 异常: " + t); }
+            rt3dRunning = false;
+            endTask(); release();
+            ui.post(() -> { if (rt3dBtn != null) rt3dBtn.setText("▶ 光追 3D（硬件 RT · ray query）"); updateFab(); });
+        }, "rt3d-init").start();
+    }
+
+    private void rt3dLoop() {
+        int buf = 0, frames = 0;
+        try {
+            while (rt3dRunning) {
+                final long t0 = System.currentTimeMillis();
+                String s;
+                try { s = nativeRtFrame(); } catch (Throwable t) { s = "X nativeRtFrame 不可用: " + t; }
+                final String line = s == null ? "（无返回）" : s.trim();
+                if (line.startsWith("X ")) { litShowNative(line, false); logBlock("光追3D失败", line); break; }
+                String e;
+                try { e = nativeRtBlit(litBufs[buf]); } catch (Throwable t) { e = "X nativeRtBlit 不可用: " + t; }
+                final Bitmap target = litBufs[buf];
+                buf ^= 1; frames++;
+                if (frames == 1 || frames % 30 == 0) log("  光追3D 帧 " + frames + " | 帧行: " + line + " | 回读: " + e);
+                litShowNative(line + " ｜ " + e, !(e != null && e.trim().startsWith("X ")));
+                final int fr = frames; final String st = (e == null ? line : e);
+                postFrame(() -> { if (litView != null) { litView.setImageBitmap(target); litView.invalidate(); } updateLitStats(st, fr); });
+                if (fpsCap) { long used = System.currentTimeMillis() - t0; if (used < 33) { try { Thread.sleep(33 - used); } catch (Throwable ignored) { } } }   /* v9.53 设置卡里的帧率上限 */
+                if (e != null && e.trim().startsWith("X ")) break;
+                /* v9.25: unlimited frame rate (user request); UI updates still throttled in postFrame */
+            }
+        } finally {
+            try { nativeRtStop(); } catch (Throwable ignored) { }
+            setStatus("光追3D已停止（最后一帧保留）", C_NEUTRAL);
+            log("  光追3D 结束：帧数 " + frames);
+        }
+    }
+
+    private void mini3dLoop() {
+        int buf = 0, frames = 0;
+        try {
+            while (m3dRunning) {
+                final long t0 = System.currentTimeMillis();      /* v9.20：限帧计时 */
+                String stat;
+                try { stat = nativeMini3DFrame(litBufs[buf]); }
+                catch (Throwable t) { litShowNative("X nativeMini3DFrame 不可用: " + t, false); log("  ✗ nativeMini3DFrame: " + t); break; }
+                boolean bad = (stat != null && (stat.startsWith("X ") || stat.contains("DEVICE_LOST")));
+                litShowNative(stat, !bad);
+                if (bad) { logBlock("迷你3D失败", stat); break; }
+                final Bitmap target = litBufs[buf];
+                buf ^= 1; frames++;
+                if (frames == 1 || frames % 300 == 0) log("  迷你3D 帧 " + frames + " · " + stat);   /* v9.13：像素统计进日志 ⇒ 离线可复核 ✓ */
+                final int fr = frames; final String st = stat;
+                postFrame(() -> { if (litView != null) { litView.setImageBitmap(target); litView.invalidate(); } updateLitStats(st, fr); });
+                if (fpsCap) { long used = System.currentTimeMillis() - t0; if (used < 33) { try { Thread.sleep(33 - used); } catch (Throwable ignored) { } } }   /* v9.53 设置卡里的帧率上限 */
+                /* v9.25: unlimited frame rate (user request); UI updates still throttled in postFrame */   /* v9.20：~30fps 上限 ——
+                    * 不限帧会让 GPU 队列永远满，Android 合成器（同一个 GPU）被饿死 ⇒ 触摸事件送不进 App ⇒ 所有按钮点不动 ✗ */
+            }
+        } finally {
+            try { nativeMini3DStop(); } catch (Throwable ignored) { }
+            final int n = frames;
+            ui.post(() -> { if (litStats != null && n == 0) litStats.setText("（无帧：初始化失败）"); });
+            setStatus("迷你3D已停止（最后一帧保留）", C_NEUTRAL);
+            log("  迷你3D 结束：帧数 " + n);
+            if (m3dBtn != null) ui.post(() -> m3dBtn.setText("▶ 迷你 3D（独立最简路径）"));
+        }
+    }
+
+    private void litShowNative(final String line, final boolean ok) {
+        if (litNativeTx == null) return;
+        final String t = line == null ? "（无返回）" : line.trim();
+        ui.post(() -> runSafe("光影返回行显示", () -> {
+            litNativeTx.setVisibility(View.VISIBLE);
+            litNativeTx.setText(ok ? t : t + "\n（这一帧保留便于诊断 ✓）");
+            litNativeTx.setTextColor(c(ok ? C_OK : C_BAD));
+        }));
+    }
+
+    private void litLoop() {
+        int buf = 1, frames = 0;
+        try {
+            while (litRunning) {
+                String stat;
+                try { stat = nativeLitFrame(); }
+                catch (Throwable t) { litShowNative("X nativeLitFrame 不可用: " + t, false); log("  ✗ nativeLitFrame: " + t); break; }
+                boolean bad = (stat != null && (stat.contains("DEVICE_LOST") || stat.startsWith("X ")));
+                litShowNative(stat, !bad);
+                if (bad) {
+                    logBlock("光影失败", stat);
+                    setStatus("光影失败（已保留最后一帧）", C_BAD);
+                    break;
+                }
+                try { nativeLitBlit(litBufs[buf]); }
+                catch (Throwable t) { log("  ✗ nativeLitBlit: " + t); break; }
+                final Bitmap target = litBufs[buf];
+                buf ^= 1; frames++;
+                progressToken++;
+                final String st = stat; final int fr = frames;
+                postFrame(() -> {
+                    if (litView != null) { litView.setImageBitmap(target); litView.invalidate(); }
+                    updateLitStats(st, fr);
+                });
+            }
+        } finally {
+            litRunning = false;
+            try { nativeLitStop(); } catch (Throwable ignored) { }
+            final int n = frames;
+            ui.post(() -> {
+                updateFab();
+                if (litStats != null && n == 0) litStats.setText("（无帧：原生接口未接入或已失败）");
+            });
+            setStatus("光影已停止（最后一帧保留）", C_NEUTRAL);
+            log("  光影结束：帧数 " + n);
+            endTask(); release();
+        }
+    }
+
+    private void updateLitStats(String stat, int frames) {
+        if (litStats == null) return;
+        try {
+        Double gpu = parseD(stat, "GPU 时间"), fps = parseD(stat, "FPS"), duty = parseD(stat, "占空比");
+        litStats.setText(String.format(Locale.ROOT, "GPU 时间 %.2f ms ｜ FPS %.1f ｜ 占空比 %.1f%% ｜ 帧 %d",
+                gpu == null ? 0.0 : gpu, fps == null ? 0.0 : fps, duty == null ? 0.0 : duty, frames));
+        } catch (Throwable t) { android.util.Log.w("gputest", "光影统计行刷新失败: " + t); }
+    }
+
+    private void stopLit(String why) {
+        if (!litRunning && litThread == null) return;
+        litRunning = false;
+        final Thread t = litThread;
+        litThread = null;
+        setStatus("光影：正在停止（" + why + "）", C_WARN);
+        new Thread(() -> {
+            if (t != null) { try { t.join(3000); } catch (InterruptedException ignored) { } }
+            try { nativeLitStop(); } catch (Throwable ignored) { }
+            ui.post(this::updateFab);
+            setStatus("光影已停止（" + why + "）· 最后一帧保留", C_NEUTRAL);
+            log("  光影已停止：" + why);
+            endTask(); release();
+        }, "gpu-lit-stop").start();
+    }
+
+    private View buildComparePage() {
+        LinearLayout col = col();
+        col.addView(card(section("A/B 对比"),
+                note("先「设为基准 A」，再选另一个驱动点「开始对比」——两段汇总数字可直接并列。"),
+                btnPrimary("设为对比基准 A", v -> setBaseline()),
+                btnTonal("开始 A/B 对比", v -> compareAB())));
+        return scroll(col);
+    }
+
+    private View buildScoreboardPage() {
+        LinearLayout col = col();
+        scoreEmpty = emptyState("ic_tab_bench", "▥", "还没有成绩",
+                "到「测试 → 跑分」跑一次，这里会列出各档结果与口径。",
+                "去跑分", () -> selectDest(DEST_TEST, SEG_TEST_BENCH, true));
+        col.addView(scoreEmpty);
+        scoreTable = text("", 12, C_TEXT, false);
+        scoreTable.setTypeface(Typeface.MONOSPACE);
+        scoreTable.setLineSpacing(0, 1.2f);
+        scoreTable.setVisibility(View.GONE);
+        col.addView(card(section("本次会话成绩（含口径）"),
+                note("跑一次跑分后，这里会列出各档成绩与口径。"),
+                scoreTable));
+        return scroll(col);
+    }
+
+    private View buildReportPage() {
+        LinearLayout col = col();
+        col.addView(card(section("导出"),
+                btnPrimary("导出 / 分享日志", v -> exportLog()),
+                btnTonal("复制设备信息", v -> copyDeviceInfo()),
+                note("HTML 报告（含内联图表）正在开发中，敬请期待。")));
+        return scroll(col);
+    }
+
+    /* ---- 语义按钮：主操作(填充) / 次操作(tonal) / 破坏性(红) ---- */
+    private Button btnPrimary(String s, View.OnClickListener l) {
+        Button b = actionBtn(s, l);
+        GradientDrawable g = new GradientDrawable();
+        g.setCornerRadius(dp(12));
+        g.setColor(c(C_TAB_ON_BG));
+        b.setBackground(g);
+        b.setTextColor(c(C_TAB_ON_TX));
+        textKeys.put(b, C_TAB_ON_TX);
+        bgKeys.remove(b);
+        primaryBtns.add(b);
+        return b;
+    }
+
+    private Button btnTonal(String s, View.OnClickListener l) { return actionBtn(s, l); }
+
+    private Button btnDanger(String s, View.OnClickListener l) {
+        Button b = actionBtn(s, l);
+        GradientDrawable g = new GradientDrawable();
+        g.setCornerRadius(dp(12));
+        g.setColor(blend(c(C_BAD), 0x22));
+        g.setStroke(dp(1), c(C_BAD));
+        b.setBackground(g);
+        tint(b, C_BAD);
+        bgKeys.remove(b);
+        dangerBtns.add(b);
+        return b;
+    }
+
+    /** 空状态：图标 + 一句说明 + 一个按钮（Material 空状态模式）。 */
+    private View emptyState(String icon, String glyph, String title, String sub, String btn, Runnable act) {
+        LinearLayout c = new LinearLayout(this);
+        c.setOrientation(LinearLayout.VERTICAL);
+        c.setGravity(Gravity.CENTER);
+        c.setPadding(dp(24), dp(32), dp(24), dp(32));
+        View ic = iconView(icon, glyph, 48, C_DIM);
+        c.addView(ic);
+        TextView t = text(title, 16, C_TEXT, true);
+        t.setGravity(Gravity.CENTER);
+        t.setPadding(0, dp(12), 0, dp(4));
+        c.addView(t);
+        TextView s = text(sub, 12, C_DIM, false);
+        s.setGravity(Gravity.CENTER);
+        s.setPadding(0, 0, 0, dp(16));
+        c.addView(s);
+        if (btn != null) {
+            Button b = btnTonal(btn, v -> { if (act != null) act.run(); });
+            c.addView(b, new LinearLayout.LayoutParams(dp(200), ViewGroup.LayoutParams.WRAP_CONTENT));
+        }
+        return card(c);
+    }
+
+    /* =========================================================================
+     *  一键跑全部驱动（v6.3）：claim 一次 ⇒ 串行遍历 ⇒ 每完成一个立刻出排名行
+     *  ⚠ 排序口径必须与界面上的说明一致（rankRulesTx / 日志同一句话）
+     * ========================================================================= */
+    private boolean isSystemPath(String p) { return "system".equals(p); }
+
+    /** ③ 从原生输出里取"那一行错误原文"（dlopen 缺库 / DEVICE_LOST / 提交失败…），截断成一行。 */
+    private String firstErrLine(String out) {
+        if (out == null) return "";
+        for (String ln : out.split("\n")) {
+            String t = ln.trim();
+            if (t.startsWith("X ") || t.contains("dlopen failed") || t.contains("not found")
+                    || t.contains("DEVICE_LOST") || t.contains("提交失败") || t.contains("调用异常")) {
+                return t.length() > 110 ? t.substring(0, 110) + "…" : t;
+            }
+        }
+        return "";
+    }
+
+    private void runAllDriversSweep() {
+        if (sweepRunning) { toast("已在跑全部驱动"); return; }
+        if (!claim("一键跑全部驱动")) return;
+        final java.util.List<String> paths = new ArrayList<>(driverPaths);
+        if (paths.isEmpty()) { release(); log("  ✗ 驱动列表为空 —— 先到「测试→驱动」扫描或提取"); toast("先扫描驱动"); return; }
+        sweepRunning = true;
+        sweepNums.clear(); sweepNames.clear(); sweepOk.clear(); sweepNote.clear();
+        log("\n=== ⚑ 一键跑全部驱动（共 " + paths.size() + " 个 · fill/blit/draw 各 5 秒 · 串行）===");
+        log("  排序口径：综合分 = 0.4×fill/最优fill + 0.3×blit/最优blit + 0.3×draw/最优draw（相对最优归一化，满分 100）；"
+            + "任一项失败 ⇒ 不计入排名，单列失败表");
+        ui.post(() -> {
+            rankTableTx.setText("（正在跑… 每完成一个就更新一行）");
+            rankFailTx.setText("（跑完汇总）");
+        });
+        beginTask("一键跑全部驱动");
+        new Thread(() -> {
+            try {
+                for (int i = 0; i < paths.size(); i++) {
+                    final String path = paths.get(i);
+                    final String nm = sweepLabel(path);                    /* ④ 用插件显示名，不再全是同名 .so */
+                    final int idx = i + 1, total = paths.size();
+                    log("\n  ────── [" + idx + "/" + total + "] " + nm + " ──────");
+                    setStatus("全部驱动 " + idx + "/" + total + "：" + nm, C_WARN);
+                    String staged = stageDriver(path);
+                    if (staged == null) { recordSweep(nm, false, 0, 0, 0, 0, "暂存驱动失败"); renderRank(); continue; }
+                    double fill = 0, blit = 0, draw = 0, duty = 0;
+                    boolean ok = true; String note0 = "";
+                    for (String mode : new String[] { "fill", "blit", "draw" }) {
+                        invalidateBench(nm + " · " + mode);
+                        lastFill = lastBlit = lastDraw = lastDuty = -1;      /* 每个模式前重置 */
+                        String out;
+                        try { out = nativeBench(staged, 5, mode); }
+                        catch (Throwable t) { out = "X 原生调用异常: " + t; }
+                        handleNativeOutput("全部驱动[" + idx + "/" + total + "] · " + mode, out);
+                        parseScores(out); parseTiming(out);                  /* ① 复用已验证的单跑解析器（幂等） */
+                        progressToken++;
+                        double v = "fill".equals(mode) ? lastFill : ("blit".equals(mode) ? lastBlit : lastDraw);
+                        if (lastDuty >= 0) duty = lastDuty;
+                        else if (lastGpuMs >= 0 && lastWallS > 0) duty = lastGpuMs / 1000.0 / lastWallS * 100.0;
+                        boolean bad = (v <= 0) || verdictOf(out) == C_BAD;
+                        if (bad) {
+                            ok = false;
+                            if (note0.length() == 0) {
+                                String err = firstErrLine(out);
+                                note0 = mode + " 失败" + (err.length() > 0 ? "：" + err : "");
+                            }
+                        }
+                        if ("fill".equals(mode)) fill = v <= 0 ? 0 : v;
+                        if ("blit".equals(mode)) blit = v <= 0 ? 0 : v;
+                        if ("draw".equals(mode)) draw = v <= 0 ? 0 : v;
+                        log("      " + mode + " = " + (v <= 0 ? "失败/无数据" : String.format(Locale.ROOT, "%.2f", v))
+                            + (lastDuty >= 0 ? String.format(Locale.ROOT, "  （GPU 占空比 %.1f%%）", lastDuty) : ""));
+                    }
+                    recordSweep(nm, ok, fill, blit, draw, duty, note0);
+                    renderRank();                                   /* 每完成一个 ⇒ 立刻重排（实时） */
+                }
+                final String table = rankTableText();
+                log("\n=== ⚑ 排名表（口径：0.4/0.3/0.3 相对最优归一化，满分 100；失败不计入）===\n" + table);
+                if (rankFailText().length() > 4) log("\n--- 失败项（不计入排名）---\n" + rankFailText());
+                setStatus("全部驱动跑完（" + paths.size() + " 个）—— 排名见「跑分」页", C_OK);
+            } catch (Throwable t) {
+                log("  ✗ 一键跑全部驱动异常: " + t);
+                setStatus("全部驱动异常", C_BAD);
+            } finally {
+                sweepRunning = false;
+                endTask(); release();
+            }
+        }, "gpu-sweep").start();
+    }
+
+    /** ④ 把来源折成短尾段：插件 com.x.y.zenith ⇒ zenith；目录 Download ⇒ Download。 */
+    private String shortTag(String source) {
+        if (source == null) return "?";
+        String t = source;
+        int sp = t.indexOf(' ');
+        if (sp >= 0 && sp + 1 < t.length()) t = t.substring(sp + 1);
+        int dot = t.lastIndexOf('.');
+        if (dot >= 0 && dot + 1 < t.length()) t = t.substring(dot + 1);
+        int sl = t.lastIndexOf('/');
+        if (sl >= 0 && sl + 1 < t.length()) t = t.substring(sl + 1);
+        return t.length() > 18 ? t.substring(0, 18) : t;
+    }
+
+    private String sweepLabel(String path) {
+        if (isSystemPath(path)) return "system（系统驱动·对照）";          /* ⑤ 保留 */
+        String lab = driverLabels.get(path);
+        if (lab == null || lab.length() == 0) lab = new File(path).getName();
+        return lab;
+    }
+
+    /**
+     * ③ 磨砂底衬：把当前页画进 1/4 缩放的 Bitmap 当快照，API 31+ 用平台
+     * `RenderEffect.createBlurEffect` 真模糊**这一层**（页面与文字层完全不受影响 ✓）。
+     * 只在切页时刷新一次（不逐帧），且测试进行中不刷新（不干扰观感判断 ✓）。
+     */
+    private void refreshBackdrop(int dest) {
+        if (blurBackdrop == null || destPages[dest] == null) return;
+        if (busy) { blurBackdrop.setVisibility(View.GONE); return; }        /* 硬约束：测试中不动效 */
+        try {
+            View page = destPages[dest];
+            int w = page.getWidth(), h = page.getHeight();
+            if (w <= 0 || h <= 0) { blurBackdrop.setVisibility(View.GONE); return; }
+            Bitmap bmp = Bitmap.createBitmap(Math.max(1, w / 4), Math.max(1, h / 4), Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas cv = new android.graphics.Canvas(bmp);
+            cv.scale(0.25f, 0.25f);
+            page.draw(cv);
+            blurBackdrop.setImageBitmap(bmp);
+            if (Build.VERSION.SDK_INT >= 31) {
+                blurBackdrop.setRenderEffect(android.graphics.RenderEffect.createBlurEffect(
+                        24f, 24f, android.graphics.Shader.TileMode.CLAMP));
+            }
+            /* v9.8：修「整页糊」bug —— 快照层 MATCH_PARENT 且 addView 在页面之后（盖在页面上），
+             *   一旦 VISIBLE 就把整页变成「放大回去的 1/4 快照 + 24px 模糊」，切页后最明显。
+             *   这里让它始终隐藏 ✓（将来要磨砂观感：改回 VISIBLE 并按底栏 64dp 裁剪快照）*/
+            blurBackdrop.setVisibility(View.GONE);
+        } catch (Throwable t) {
+            android.util.Log.w("gputest", "磨砂底衬失败（回退到半透色）: " + t);
+            if (blurBackdrop != null) blurBackdrop.setVisibility(View.GONE);
+        }
+    }
+
+    private void runAllRenderersStub() {
+        log("  ⏸ 「一键跑全部渲染器」：**转译链尚未接入（等原生 v6.4）** —— 本按钮先占位，不做任何原生调用。");
+        toast("转译链尚未接入（等原生 v6.4）");
+    }
+
+    private void recordSweep(String name, boolean ok, double fill, double blit, double draw, double duty, String note0) {
+        sweepNames.add(name); sweepOk.add(ok); sweepNote.add(note0 == null ? "" : note0);
+        sweepNums.add(new double[] { fill, blit, draw, duty });
+    }
+
+    /** 归一化 + 排序 + 出表（口径与界面/日志一致）。 */
+    private double[] sweepScore() {
+        double mf = 0, mb = 0, md = 0;
+        for (int i = 0; i < sweepNums.size(); i++) {
+            if (!sweepOk.get(i)) continue;
+            double[] v = sweepNums.get(i);
+            mf = Math.max(mf, v[0]); mb = Math.max(mb, v[1]); md = Math.max(md, v[2]);
+        }
+        double[] sc = new double[sweepNums.size()];
+        for (int i = 0; i < sweepNums.size(); i++) {
+            if (!sweepOk.get(i)) { sc[i] = -1; continue; }
+            double[] v = sweepNums.get(i);
+            sc[i] = 100.0 * (0.4 * (mf > 0 ? v[0] / mf : 0)
+                           + 0.3 * (mb > 0 ? v[1] / mb : 0)
+                           + 0.3 * (md > 0 ? v[2] / md : 0));
+        }
+        return sc;
+    }
+
+    private String rankTableText() {
+        double[] sc = sweepScore();
+        Integer[] order = new Integer[sweepNums.size()];
+        for (int i = 0; i < order.length; i++) order[i] = i;
+        java.util.Arrays.sort(order, (a, b) -> Double.compare(sc[b], sc[a]));
+        StringBuilder b = new StringBuilder();
+        b.append(String.format(Locale.ROOT, "%-3s %-28s %7s %10s %8s %10s %7s  %s%n",
+                "#", "驱动", "综合分", "fill", "blit", "draw", "占空比", "备注"));
+        int rank = 0;
+        for (Integer i : order) {
+            if (!sweepOk.get(i)) continue;                       /* 失败项不进排名 */
+            rank++;
+            double[] v = sweepNums.get(i);
+            b.append(String.format(Locale.ROOT, "%-3d %-28s %7.1f %10.2f %8.2f %10.0f %6.1f%%  %s%n",
+                    rank, trim(sweepNames.get(i), 28), sc[i], v[0], v[1], v[2], v[3],
+                    i == 0 && isSystemPathName(sweepNames.get(i)) ? "系统驱动(对照)" : ""));
+        }
+        if (rank == 0) b.append("（没有可计入排名的驱动 —— 全部失败）\n");
+        return b.toString();
+    }
+
+    private String rankFailText() {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < sweepNums.size(); i++)
+            if (!sweepOk.get(i))
+                b.append(String.format(Locale.ROOT, "%-34s %s%n", trim(sweepNames.get(i), 34),
+                        sweepNote.get(i).length() == 0 ? "失败（DEVICE_LOST/无数据）" : sweepNote.get(i)));
+        return b.length() == 0 ? "（无失败项）" : b.toString();
+    }
+
+    private boolean isSystemPathName(String n) { return n != null && n.contains("系统驱动"); }
+
+    private String trim(String s, int n) { return s == null ? "" : (s.length() <= n ? s : s.substring(0, n - 1) + "…"); }
+
+    private void renderRank() {
+        final String t = rankTableText(), f = rankFailText();
+        ui.post(() -> {
+            if (rankTableTx != null) rankTableTx.setText(t);
+            if (rankFailTx != null) rankFailTx.setText(f);
+        });
+    }
+
+    private void copyRankTable() {
+        try {
+            String txt = rankTableText() + "\n--- 失败项（不计入排名）---\n" + rankFailText();
+            android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                    getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("gputest rank", txt));
+            log("\n=== 排名表（已复制到剪贴板）===\n" + txt);
+            toast("排名表已复制");
+        } catch (Throwable t) { log("  ✗ 复制排名表失败: " + t); }
+    }
+
+    private void copyDeviceInfo() {
+        try {
+            String info = stressDeviceLines();
+            android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                    getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("gputest device", info));
+            toast("设备信息已复制");
+        } catch (Throwable t) { log("  ✗ 复制失败: " + t); }
+    }
+
+    /** 主题切换后重刷 App 骨架（App Bar / 底栏 / FAB / 分段 / 图标）。 */
+    private void applyChromeColors() {
+        if (appBar != null) appBar.setBackgroundColor(withAlpha(c(C_CARD), x(3)));
+        if (bottomNav != null) bottomNav.setBackgroundColor(withAlpha(c(C_CARD), x(3)));
+        for (java.util.Map.Entry<View, Integer> e : iconKeys.entrySet()) {
+            View v = e.getKey(); Integer k = e.getValue();
+            if (v instanceof ImageView && k != null) ((ImageView) v).setColorFilter(c(k));
+        }
+        if (busyChip != null) stylePill(busyChip, false);
+        if (driverChip != null) stylePill(driverChip, false);
+        styleBottomNav();
+        for (LitRow lr : litRows) styleLitRow(lr);          /* 光影面板 pill 也跟主题走 ✓ */
+        if (rtCardBox != null) rtCardBox.setBackground(rtBigCardBg());   /* 光追大卡描边/圆角跟主题 ✓ */
+        styleSegRow(0, segTest);
+        styleSegRow(1, segRender);
+        styleSegRow(2, segRec);
+        for (Button b : primaryBtns) {                      /* 主操作按钮：填充主色 */
+            GradientDrawable g = new GradientDrawable();
+            g.setCornerRadius(dp(12));
+            g.setColor(c(C_TAB_ON_BG));
+            b.setBackground(g);
+            b.setTextColor(c(C_TAB_ON_TX));
+        }
+        for (Button b : dangerBtns) {                       /* 破坏性按钮：红字红边 */
+            GradientDrawable g = new GradientDrawable();
+            g.setCornerRadius(dp(12));
+            g.setColor(blend(c(C_BAD), 0x22));
+            g.setStroke(dp(1), c(C_BAD));
+            b.setBackground(g);
+            b.setTextColor(c(C_BAD));
+        }
+        updateFab();
+    }
+
+    /** 状态栏/导航栏跟随主题（浅色主题用深色图标）。 */
+    private void applyWindowChrome() {
+        try {
+            getWindow().setStatusBarColor(c(C_CARD));
+            getWindow().setNavigationBarColor(c(C_BG));
+            View dv = getWindow().getDecorView();
+            int flags = dv.getSystemUiVisibility();
+            if (themeIdx == 1) flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;   /* 浅色主题：深色状态栏图标 */
+            else               flags &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            dv.setSystemUiVisibility(flags);
+        } catch (Throwable t) { android.util.Log.w("gputest", "窗口配色失败: " + t); }
+    }
+
     /* ---------------------------- 主题机制 ---------------------------- */
     /** 给 TextView 上色并**登记键**（切换主题时按同一个键重刷 ⇒ 不会留旧色）。 */
+    /** ④ 数字变化：150ms 透明度交叉淡入（不做滚动计数）。 */
+    private void setNumFade(TextView v, String s) {
+        if (v == null) return;
+        v.animate().cancel();
+        v.setAlpha(0.35f);
+        v.setText(s);
+        v.animate().alpha(1f).setDuration(150).start();
+    }
+
     private void tint(TextView v, int key) {
         if (v == null) return;
         textKeys.put(v, key);
@@ -2249,6 +4180,7 @@ public class MainActivity extends Activity {
     private void applyTheme(int idx, boolean persist) {
         themeIdx = ((idx % THEMES.length) + THEMES.length) % THEMES.length;
         CUR = THEMES[themeIdx].p.clone();
+        CURX = THEMES[themeIdx].x.clone();
         if (rootV != null) rootV.setBackgroundColor(c(C_BG));
         for (java.util.Map.Entry<View, Integer> e : textKeys.entrySet()) {
             View v = e.getKey(); Integer k = e.getValue();
@@ -2258,12 +4190,17 @@ public class MainActivity extends Activity {
             View v = e.getKey(); Integer k = e.getValue();
             if (v == null || k == null) continue;
             int fillKey = k / 100, radius = k % 100;
+            if (fillKey == C_CARD) radius = x(0);              /* 卡片圆角跟随主题（ColorOS 20dp ✓） */
+            if (fillKey == C_BTN_BG) radius = x(1);            /* 按钮圆角跟随主题（16dp ✓） */
             if (radius == 0) v.setBackgroundColor(c(fillKey));
+            else if (fillKey == C_CARD || fillKey == C_BTN_BG) v.setBackground(themedBg(fillKey, radius));
             else v.setBackground(cardBg(c(fillKey), c(C_STROKE), radius));
         }
         for (java.util.Map.Entry<Button, Boolean> e : tabStates.entrySet())
             if (e.getKey() != null) styleTab(e.getKey(), Boolean.TRUE.equals(e.getValue()));
         if (themeBtn != null) themeBtn.setText(themeLabel());
+        applyChromeColors();                                 /* v6.1：App Bar/底栏/FAB/分段 跟着主题走 */
+        applyWindowChrome();                                 /* 状态栏/导航栏跟随主题 */
         if (persist) {
             try {
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit()
@@ -2282,6 +4219,53 @@ public class MainActivity extends Activity {
                 if (THEMES[i].id.equals(id)) { themeIdx = i; break; }
         } catch (Throwable t) { android.util.Log.w("gputest", "读取主题失败: " + t); }
         CUR = THEMES[themeIdx].p.clone();
+    }
+
+    /** ② 柔性触控反馈：按下 0.96 + 下移 1dp（120ms），抬起/取消回弹（220ms Overshoot）。
+     *  只挂在**可点控件**上；结果卡不挂（避免干扰读数的观感判断）✓ */
+    private void fluid(final View v) {
+        if (v == null) return;
+        v.setOnTouchListener((view, ev) -> {
+            try {
+                switch (ev.getActionMasked()) {
+                    case android.view.MotionEvent.ACTION_DOWN:
+                        view.animate().scaleX(0.96f).scaleY(0.96f).translationY(dp(1))
+                            .setDuration(120)
+                            .setInterpolator(new android.view.animation.PathInterpolator(0.0f, 0.0f, 0.2f, 1.0f))
+                            .start();
+                        break;
+                    case android.view.MotionEvent.ACTION_UP:
+                    case android.view.MotionEvent.ACTION_CANCEL:
+                        view.animate().scaleX(1f).scaleY(1f).translationY(0f)
+                            .setDuration(220)
+                            .setInterpolator(new android.view.animation.OvershootInterpolator(1.2f))
+                            .start();
+                        break;
+                    default: break;
+                }
+            } catch (Throwable ignored) { }
+            return false;                                       /* 返回 false ⇒ 点击事件照常派发 ✓ */
+        });
+    }
+
+    /** ★ 启动保险（硬规矩）：建页失败只降级这一页 + 写日志，绝不让整个 App 进不去 ✓ */
+    private View safePage(String name, java.util.function.Supplier<View> maker) {
+        try { return maker.get(); }
+        catch (Throwable t) {
+            log("  ✗ 建页失败[" + name + "]（已降级，其它页可用）: " + t);
+            LinearLayout box = new LinearLayout(this);
+            box.setOrientation(LinearLayout.VERTICAL);
+            box.setPadding(dp(16), dp(16), dp(16), dp(16));
+            box.addView(text("「" + name + "」页构建失败（已降级）", 16, C_BAD, true));
+            box.addView(note("原因：" + t + "\n（启动保险：不影响其它页面与功能）"));
+            return scroll(box);
+        }
+    }
+
+    /** ★ 启动保险：把"启动期自动做的事"跑在 try/catch 里并写日志 ✓ */
+    private void runSafe(String tag, Runnable r) {
+        try { r.run(); }
+        catch (Throwable t) { log("  ✗ [" + tag + "] 启动期自动动作失败（已忽略）: " + t); }
     }
 
     private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
