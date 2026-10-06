@@ -20,6 +20,9 @@ H = {"Authorization": "token " + TOK, "User-Agent": "dsh", "Accept": "applicatio
 REPO = "SailasMC/gpu-driver-testbed"
 
 def call(url, method="GET", data=None, ctype=None, tries=5):
+    if isinstance(data, (dict, list)):          # 重构时漏了这步 ⇒ can't concat str to bytes
+        data = json.dumps(data).encode()
+        ctype = ctype or "application/json"
     last = None
     for i in range(tries):
         h = dict(H)
