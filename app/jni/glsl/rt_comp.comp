@@ -202,7 +202,9 @@ void main() {
                 base += albedo * vec3(1.0, 0.84, 0.58) * (att * ndl * vis) * 1.4;   /* 灯照 + 灯影 */
             }
             /* 光晕：与法线无关、随距离衰减 —— 泛光的廉价近似 ✓ */
-            float halo = LI / (1.0 + 2.2 * d2) * (float(pc.rtOpt.w) / 100.0);
+            /* v11.6 · 双叶光晕（近距紧 + 宽域松）=> 更接近真泛光的观感 ✓ */
+            float w2 = float(pc.rtOpt.w) / 100.0;
+            float halo = (LI / (1.0 + 2.2 * d2) + 0.55 * LI / (1.0 + 0.9 * d)) * w2;
             base += vec3(1.0, 0.86, 0.62) * halo * 0.55;
         }
         col = base;   /* v9.97: 撤掉多余的压暗 —— base 里已含 97% 反射（fres=0.97）⇒ 镜子本身就是反射像 ✓ */

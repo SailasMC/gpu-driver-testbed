@@ -315,6 +315,9 @@ public class MainActivity extends Activity {
     private float liveGpuT = -1f, liveMemMB = -1f;
     /* v10.7 · 帧统计（gfxinfo）*/
     private int liveJankPct = -1, liveF50 = -1, liveG50 = -1, liveFrames = -1;
+    /* v12.0 · GPU 频率（tracefs）*/
+    private float liveFreqMHz = -1f;
+    private final java.util.ArrayList<Float> freqHist = new java.util.ArrayList<>();
 
     /** 一行离散开关（pill）：键名 / 取值表 / 当前选中。 */
     private static final class LitRow {
@@ -932,6 +935,8 @@ public class MainActivity extends Activity {
         final int idx = paths.size() - 1;
 
         RadioButton rb = new RadioButton(this);
+        rb.setMaxLines(1);                                   /* v11.7: 驱动行只占一行 —— 元数据本就在顶部选择栏 ✓ 不再被长文本撑高 ✗ */
+        rb.setEllipsize(android.text.TextUtils.TruncateAt.END);
         tint(rb, C_TEXT);
         rb.setTextSize(13);
         rb.setTag(idx);
@@ -2256,6 +2261,8 @@ public class MainActivity extends Activity {
         stressView.setAdjustViewBounds(true);
         stressView.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
         stressView.setBackgroundColor(c(C_RENDER_BG));
+        stressView.setMinimumHeight(dp(220));   /* v11.6: 空态也占一块视口高度，不再是一道空白 ✗ */
+        stressView.setContentDescription("压力测试画面区域（开始后显示）");
         col.addView(card(section("压力画面（" + STRESS_W + "x" + STRESS_H + "，越堆越多的半透明三角形）"),
                 stressView,
                 note("停止时保留最后一帧 —— 崩之前那一帧才是诊断证据。")));
@@ -2685,7 +2692,7 @@ public class MainActivity extends Activity {
     private boolean isSystemDriver() { String p = selectedPath(); return p == null || p.equals("system"); }
 
     /* v9.48 · Shizuku/Stellar 探针（经 IShizukuService 公开路径）*/
-    private static final String[] SHZ_CMDS = { "getprop ro.product.model", "getprop ro.board.platform", "getprop ro.hardware", "getprop | grep -i -e gpu -e vulkan -e mali -e mediatek | head -15", "dumpsys SurfaceFlinger | head -12", "dumpsys thermalservice | head -60", "dumpsys gpu | head -30", "cat /proc/meminfo | head -6", "cat /proc/loadavg", "ls /sys/class/devfreq/", "ls /sys/class/thermal/ 2>&1 | head -6", "ls /sys/kernel/ged/ 2>&1 | head -4", "dumpsys gfxinfo com.dsh.gputest | head -22", "dumpsys meminfo com.dsh.gputest | head -16", "dumpsys battery | head -12" };   /* v11.5: 本 App 内存 + 电池温度（binder 路 ✓）*/   /* v10.6: 渲染性能统计（binder 路 ✓）*/   /* v10.2: + thermalservice/gpu（走 binder，绕开 SELinux ✓）*/
+    private static final String[] SHZ_CMDS = { "getprop ro.product.model", "getprop ro.board.platform", "getprop ro.hardware", "getprop | grep -i -e gpu -e vulkan -e mali -e mediatek | head -15", "dumpsys SurfaceFlinger | head -12", "dumpsys thermalservice | head -60", "dumpsys gpu | head -30", "cat /proc/meminfo | head -6", "cat /proc/loadavg", "ls /sys/class/devfreq/", "ls /sys/class/thermal/ 2>&1 | head -6", "ls /sys/kernel/ged/ 2>&1 | head -4", "dumpsys gfxinfo com.dsh.gputest | head -22", "dumpsys meminfo com.dsh.gputest | head -16", "dumpsys battery | head -12", "T0=1; echo 1 > /sys/kernel/tracing/tracing_on; echo 1 > /sys/kernel/tracing/events/power/gpu_frequency/enable; sleep 1; grep -a -m8 gpu_frequency /sys/kernel/tracing/trace; echo 0 > /sys/kernel/tracing/events/power/gpu_frequency/enable; echo  > /sys/kernel/tracing/tracing_on" };   /* v11.8: GPU 频率（tracefs 事件 ✓ 0666 可写 ✓ 无需 root/perfetto ✓）*/   /* v11.5: 本 App 内存 + 电池温度（binder 路 ✓）*/   /* v10.6: 渲染性能统计（binder 路 ✓）*/   /* v10.2: + thermalservice/gpu（走 binder，绕开 SELinux ✓）*/
 
     private void shizukuProbe() {
         if (!claim("Shizuku 探针")) return;
@@ -2719,7 +2726,7 @@ public class MainActivity extends Activity {
     /* v10.3 · 实时监视（不占 busy 位，可与光追/跑分同时跑 ✓）*/
     private static final String[] LIVE_CMDS = {
         "dumpsys thermalservice | grep -m6 -e Current -e GPU -e CPU",
-        "dumpsys gpu | grep -m3 -e Global -e Driver", "dumpsys gfxinfo com.dsh.gputest | grep -m10 -e Total -e Janky -e percentile", "dumpsys meminfo com.dsh.gputest | grep -m6 -e TOTAL -e Native -e Graphics" };   /* v11.5: 实时也带内存 ✓ */   /* v10.6: 真渲染性能（帧时间分布/卡顿率）*/
+        "dumpsys gpu | grep -m3 -e Global -e Driver", "dumpsys gfxinfo com.dsh.gputest | grep -m10 -e Total -e Janky -e percentile", "dumpsys meminfo com.dsh.gputest | grep -m6 -e TOTAL -e Native -e Graphics", "T0=1; echo 1 > /sys/kernel/tracing/tracing_on; echo 1 > /sys/kernel/tracing/events/power/gpu_frequency/enable; sleep 1; grep -a -m8 gpu_frequency /sys/kernel/tracing/trace; echo 0 > /sys/kernel/tracing/events/power/gpu_frequency/enable; echo  > /sys/kernel/tracing/tracing_on" };   /* v11.8: 实时监视也采频率 ✓ 负载下才有变化记录 ✓ */   /* v11.5: 实时也带内存 ✓ */   /* v10.6: 真渲染性能（帧时间分布/卡顿率）*/
     /* v10.4 · 趋势解析与绘制（块字符 sparkline ✓ 零依赖 ✓）*/
     private void liveParse(String t) {
         try {
@@ -2737,6 +2744,10 @@ public class MainActivity extends Activity {
             if (m5.find()) liveF50 = Integer.parseInt(m5.group(1));
             java.util.regex.Matcher m6 = java.util.regex.Pattern.compile("50th gpu percentile: ([0-9]+)ms").matcher(t);
             if (m6.find()) liveG50 = Integer.parseInt(m6.group(1));
+            java.util.regex.Matcher m7 = java.util.regex.Pattern.compile("state=([0-9]+) gpu_id").matcher(t);
+            float fr = -1f;
+            while (m7.find()) fr = Float.parseFloat(m7.group(1)) / 1000f;
+            if (fr > 0f) { liveFreqMHz = fr; freqHist.add(fr); if (freqHist.size() > 24) freqHist.remove(0); }
         } catch (Throwable ignored) { }
     }
     private String liveRender() {
@@ -2755,6 +2766,17 @@ public class MainActivity extends Activity {
             b.append(String.format(java.util.Locale.US, "   最低 %.1f / 最高 %.1f °C", mn, mx));
         }
         if (liveMemMB > 0f) b.append(String.format(java.util.Locale.US, "GPU 显存：%.0f MB", liveMemMB));
+        if (liveFreqMHz > 0f) {
+            b.append(String.format(java.util.Locale.US, "GPU 频率：%.0f MHz", liveFreqMHz));
+            if (freqHist.size() >= 2) {
+                float fmn = 9e9f, fmx = -1f;
+                for (float v : freqHist) { if (v < fmn) fmn = v; if (v > fmx) fmx = v; }
+                String[] sp2 = { "_", ".", "-", "=", "+", "*", "#", "@" };
+                b.append(" 频率趋势：");
+                for (float v : freqHist) { int k2 = (fmx - fmn) < 0.5f ? 3 : (int) ((v - fmn) / (fmx - fmn) * 7f + 0.5f); if (k2 < 0) k2 = 0; if (k2 > 7) k2 = 7; b.append(sp2[k2]); }
+                b.append(String.format(java.util.Locale.US, "   最低 %.0f / 最高 %.0f MHz", fmn, fmx));
+            }
+        }
         if (liveFrames > 0) b.append(String.format(java.util.Locale.US, "帧：%d 帧 · 卡顿 %d%% · 帧时间 50th %dms · GPU 50th %dms", liveFrames, liveJankPct, liveF50, liveG50));
         b.append("");
         return b.toString();
