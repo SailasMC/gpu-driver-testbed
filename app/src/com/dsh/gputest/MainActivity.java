@@ -318,6 +318,9 @@ public class MainActivity extends Activity {
     /* v12.0 · GPU 频率（tracefs）*/
     private float liveFreqMHz = -1f;
     private int liveUtilPct = -1, liveGpuMemMB = -1;   /* v12.4 · 占用率 / 全局显存 */
+    /* v12.5 · 占用率曲线 + 归属 uid */
+    private final java.util.ArrayList<Integer> utilHist = new java.util.ArrayList<>();
+    private int liveLastUid = -1;
     private final java.util.ArrayList<Float> freqHist = new java.util.ArrayList<>();
 
     /** 一行离散开关（pill）：键名 / 取值表 / 当前选中。 */
@@ -2753,6 +2756,9 @@ public class MainActivity extends Activity {
             java.util.regex.Matcher m8 = java.util.regex.Pattern.compile("start_time_ns=([0-9]+) end_time_ns=([0-9]+) total_active_duration_ns=([0-9]+)").matcher(t);
             while (m8.find()) { winNs += Long.parseLong(m8.group(2)) - Long.parseLong(m8.group(1)); actNs += Long.parseLong(m8.group(3)); }
             if (winNs > 0L) liveUtilPct = (int) Math.min(100L, actNs * 100L / winNs);
+            if (liveUtilPct >= 0) { utilHist.add(liveUtilPct); if (utilHist.size() > 24) utilHist.remove(0); }
+            java.util.regex.Matcher m10 = java.util.regex.Pattern.compile("uid=([0-9]+)").matcher(t);
+            while (m10.find()) liveLastUid = Integer.parseInt(m10.group(1));
             java.util.regex.Matcher m9 = java.util.regex.Pattern.compile("gpu_mem_total: gpu_id=[0-9]+ pid=[0-9]+ size=([0-9]+)").matcher(t);
             long mx2 = -1L;
             while (m9.find()) { long v2 = Long.parseLong(m9.group(1)); if (v2 > mx2) mx2 = v2; }
@@ -2776,6 +2782,15 @@ public class MainActivity extends Activity {
         }
         if (liveMemMB > 0f) b.append(String.format(java.util.Locale.US, "GPU 显存：%.0f MB", liveMemMB));
         if (liveUtilPct >= 0 || liveGpuMemMB > 0) b.append(String.format(java.util.Locale.US, "GPU 占用：%d%% · 全局显存：%d MB", liveUtilPct < 0 ? 0 : liveUtilPct, liveGpuMemMB < 0 ? 0 : liveGpuMemMB));
+        if (utilHist.size() >= 2) {
+            int umn = 999, umx = -1;
+            for (int v : utilHist) { if (v < umn) umn = v; if (v > umx) umx = v; }
+            String[] sp3 = { "_", ".", "-", "=", "+", "*", "#", "@" };
+            b.append(" 占用趋势：");
+            for (int v : utilHist) { int k3 = (umx - umn) < 1 ? 3 : (int) ((v - umn) * 7.0 / (umx - umn) + 0.5); if (k3 < 0) k3 = 0; if (k3 > 7) k3 = 7; b.append(sp3[k3]); }
+            b.append(String.format(java.util.Locale.US, "   最低 %d%% / 最高 %d%%", umn, umx));
+        }
+        if (liveLastUid >= 0) b.append(String.format(java.util.Locale.US, "GPU 活跃 uid：%d", liveLastUid));
         if (liveFreqMHz > 0f) {
             b.append(String.format(java.util.Locale.US, "GPU 频率：%.0f MHz", liveFreqMHz));
             if (freqHist.size() >= 2) {
@@ -2819,6 +2834,19 @@ public class MainActivity extends Activity {
                 }
                 h.append("</div>");
             } else h.append("<div>（无采样：请先在设置页开启实时监视）</div>");
+            h.append("<h3>GPU 占用率趋势</h3>");
+            if (utilHist.size() > 0) {
+                int umn2 = 999, umx2 = -1;
+                for (int v : utilHist) { if (v < umn2) umn2 = v; if (v > umx2) umx2 = v; }
+                h.append("<div>最低 ").append(umn2).append("% · 最高 ").append(umx2).append("% · 样本 ").append(utilHist.size()).append("</div>");
+                h.append("<div style=&apos;height:100px;display:flex;align-items:flex-end;gap:2px;background:#1a1d23;padding:8px;border-radius:8px&apos;>");
+                for (int v : utilHist) {
+                    int hh3 = (umx2 - umn2) < 1 ? 50 : (int) (8 + 84.0 * (v - umn2) / (umx2 - umn2));
+                    h.append("<div style=&apos;width:12px;height:").append(hh3).append("px;background:linear-gradient(#e34e4e,#e3c04e);border-radius:2px&apos;></div>");
+                }
+                h.append("</div>");
+            } else h.append("<div>（无占用采样：请开启实时监视）</div>");
+            if (liveLastUid >= 0) h.append("<div>GPU 活跃 uid：").append(liveLastUid).append("</div>");
             h.append("<h3>GPU 频率趋势</h3>");
             if (freqHist.size() > 0) {
                 float fmn = 9e9f, fmx = -1f;
