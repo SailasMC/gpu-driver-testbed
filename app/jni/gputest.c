@@ -703,38 +703,104 @@ static int mk_buf(Ctx *c, VkDeviceSize sz, VkBufferUsageFlags use, VkBuffer *out
 }
 
 /* 场景网格：UV 球（约 480 三角形）+ 一块地面 */
-static int rt_make_mesh(Ctx *c, float **vout, uint32_t **iout, uint32_t *ntri) {
-    const int SEG = 24, RING = 12;
-    int nv = (RING + 1) * (SEG + 1) + 4;
+static int rt_make_mesh(Ctx *c, float **vout, uint32_t **iout, uint32_t *ntri, uint32_t *nvout) {   /* v9.83: 顶点数由生成器返回，不再硬编码 ✗→✓ */
+    /* v9.78 · 游戏感场景：6 个球（与 rt_comp.comp 里的 SC/SR 表逐项一致 ✓）+ 棋盘格地面 */
+    /* v9.79 · 室内竞技场（暗区突围风）：地板/天花/四墙 + 6 木箱 + 2 油桶
+     * 与 rt_comp.comp 的 BOX/SPH/R/H 逐项一致 ✓ */
+    const int SEG = 20, RING = 10, NSP = 3, NB = 12;   /* v9.93: 表里其实有 12 行（含两面镜）—— 之前 NB=10 把镜子截掉了 ✗ */
+    static const float SPH[NSP][4] = { { -0.9f, 0.55f, 0.6f, 0.55f }, { 1.5f, 0.45f, -2.6f, 0.45f },
+                                       { 3.1f, 0.60f, 1.9f, 0.60f } };
+    static const float BOX[NB][6] = {
+        { -1.6f, 0.45f, -1.5f, 0.45f, 0.45f, 0.45f },
+        {  0.2f, 0.35f, -2.2f, 0.35f, 0.35f, 0.35f },
+        {  1.9f, 0.60f, -0.8f, 0.60f, 0.60f, 0.60f },
+        { -2.6f, 0.30f,  1.2f, 0.30f, 0.30f, 0.30f },
+        {  0.9f, 0.50f,  1.8f, 0.50f, 0.50f, 0.50f },
+        {  2.4f, 0.40f,  2.6f, 0.40f, 0.40f, 0.40f },
+        { -3.3f, 0.70f, -0.6f, 0.70f, 0.70f, 0.70f },
+        { -3.3f, 2.10f, -0.6f, 0.70f, 0.70f, 0.70f },   /* 叠放 */
+        {  0.2f, 1.05f, -2.2f, 0.35f, 0.35f, 0.35f },   /* 小箱摞在大箱上 */
+        {  2.4f, 1.20f,  2.6f, 0.40f, 0.40f, 0.40f },
+        { -4.36f, 1.60f, 0.0f, 0.06f, 1.55f, 2.60f },   /* ★ 左墙镜面 */
+        {  4.36f, 1.60f, 0.0f, 0.06f, 1.55f, 2.60f },   /* ★ 右墙镜面 */
+    };
+    int nv = NSP * (RING + 1) * (SEG + 1) + NB * 8 + 4 + 20;
     float *v = (float *) malloc(sizeof(float) * nv * 3);
-    uint32_t *idx = (uint32_t *) malloc(sizeof(uint32_t) * (SEG * RING * 6 + 6));
+    uint32_t *idx = (uint32_t *) malloc(sizeof(uint32_t) * (NSP * SEG * RING * 6 + NB * 36 + 6 + 60));   /* v9.82: 房间四边形正反各一份 */
     int vi = 0;
-    for (int r = 0; r <= RING; r++) {
-        float phi = (float) r / RING * 3.14159265f;
-        for (int sg = 0; sg <= SEG; sg++) {
-            float th = (float) sg / SEG * 6.2831853f;
-            v[vi*3+0] = 0.9f * sinf(phi) * cosf(th);
-            v[vi*3+1] = 0.9f * cosf(phi) + 0.9f;
-            v[vi*3+2] = 0.9f * sinf(phi) * sinf(th);
+    for (int si = 0; si < NSP; si++) {
+        for (int r = 0; r <= RING; r++) {
+            float phi = (float) r / RING * 3.14159265f;
+            for (int sg = 0; sg <= SEG; sg++) {
+                float th = (float) sg / SEG * 6.2831853f;
+                v[vi*3+0] = SPH[si][3] * sinf(phi) * cosf(th) + SPH[si][0];
+                v[vi*3+1] = SPH[si][3] * cosf(phi) + SPH[si][1];
+                v[vi*3+2] = SPH[si][3] * sinf(phi) * sinf(th) + SPH[si][2];
+                vi++;
+            }
+        }
+    }
+    for (int bi = 0; bi < NB; bi++) {
+        for (int k = 0; k < 8; k++) {
+            v[vi*3+0] = BOX[bi][0] + ((k & 1) ? BOX[bi][3] : -BOX[bi][3]);
+            v[vi*3+1] = BOX[bi][1] + ((k & 2) ? BOX[bi][4] : -BOX[bi][4]);
+            v[vi*3+2] = BOX[bi][2] + ((k & 4) ? BOX[bi][5] : -BOX[bi][5]);
             vi++;
         }
     }
     int base = vi;   /* 地面 4 顶点 */
-    float gp[4][3] = { { -3,0,-3 }, { 3,0,-3 }, { 3,0,3 }, { -3,0,3 } };
+    const float R = 4.5f, H = 4.2f;   /* v9.79: 室内 9x9、层高 4.2 */
+    float gp[4][3] = { { -R,0,-R }, { R,0,-R }, { R,0,R }, { -R,0,R } };
     for (int i = 0; i < 4; i++) { v[vi*3+0]=gp[i][0]; v[vi*3+1]=gp[i][1]; v[vi*3+2]=gp[i][2]; vi++; }
+    {
+        float qs[5][4][3] = {
+            { {-R,H,-R}, { R,H,-R}, { R,H,R}, {-R,H,R} },
+            { {-R,0,-R}, { R,0,-R}, { R,H,-R}, {-R,H,-R} },
+            { {-R,0, R}, { R,0, R}, { R,H, R}, {-R,H, R} },
+            { {-R,0,-R}, {-R,0,R}, {-R,H,R}, {-R,H,-R} },
+            { { R,0,-R}, { R,0,R}, { R,H,R}, { R,H,-R} },
+        };
+        for (int qi2 = 0; qi2 < 5; qi2++) for (int k = 0; k < 4; k++) {
+            v[vi*3+0]=qs[qi2][k][0]; v[vi*3+1]=qs[qi2][k][1]; v[vi*3+2]=qs[qi2][k][2]; vi++;
+        }
+    }
     uint32_t *ii = idx; int ni = 0;
-    for (int r = 0; r < RING; r++) for (int sg = 0; sg < SEG; sg++) {
-        uint32_t a = r*(SEG+1)+sg, b = a+1, cc = a+(SEG+1), d = cc+1;
-        ii[ni++]=a; ii[ni++]=cc; ii[ni++]=b;  ii[ni++]=b; ii[ni++]=cc; ii[ni++]=d;
+    for (int si = 0; si < NSP; si++) {
+        int off = si * (RING + 1) * (SEG + 1);
+        for (int r = 0; r < RING; r++) for (int sg = 0; sg < SEG; sg++) {
+            uint32_t a = off + r*(SEG+1)+sg, b = a+1, cc = a+(SEG+1), d = cc+1;
+            ii[ni++]=a; ii[ni++]=cc; ii[ni++]=b;  ii[ni++]=b; ii[ni++]=cc; ii[ni++]=d;
+        }
+    }
+    for (int bi = 0; bi < NB; bi++) {
+        uint32_t o = (uint32_t)(NSP * (RING + 1) * (SEG + 1) + bi * 8);
+        uint32_t q[8]; for (int k = 0; k < 8; k++) q[k] = o + (uint32_t) k;
+        int f[6][4] = { {0,2,3,1}, {4,5,7,6}, {0,1,5,4}, {2,6,7,3}, {0,4,6,2}, {1,3,7,5} };
+        for (int fi = 0; fi < 6; fi++) {
+            ii[ni++]=q[f[fi][0]]; ii[ni++]=q[f[fi][1]]; ii[ni++]=q[f[fi][2]];
+            ii[ni++]=q[f[fi][0]]; ii[ni++]=q[f[fi][2]]; ii[ni++]=q[f[fi][3]];
+        }
+    }
+    {
+        uint32_t fb = (uint32_t)(NSP * (RING + 1) * (SEG + 1) + NB * 8 + 4);   /* 天花/四墙顶点起点 */
+        for (int qi2 = 0; qi2 < 5; qi2++) {
+            uint32_t a = fb + (uint32_t) qi2 * 4;
+            /* v9.82: 正反两面都生成 —— 无论绕序/是否开背面剔除都能被射线命中 ✓ */
+            ii[ni++]=a; ii[ni++]=a+1; ii[ni++]=a+2;  ii[ni++]=a; ii[ni++]=a+2; ii[ni++]=a+3;
+            ii[ni++]=a+2; ii[ni++]=a+1; ii[ni++]=a;  ii[ni++]=a+3; ii[ni++]=a+2; ii[ni++]=a;
+        }
     }
     ii[ni++]=base; ii[ni++]=base+1; ii[ni++]=base+2; ii[ni++]=base; ii[ni++]=base+2; ii[ni++]=base+3;
-    *vout = v; *iout = idx; *ntri = (uint32_t)(ni / 3);
+    *vout = v; *iout = idx; *ntri = (uint32_t)(ni / 3); *nvout = (uint32_t) vi;
     return 1;
 }
 
 
 /* 光追推常量（与 rt.comp 的 push_constant 块逐字段对齐 ✓ 112 字节）*/
-typedef struct { float invVP[16]; float camPos[4]; float lightDir[4]; int shadowOn; int bounces; float t; int _pad; } RtPC;
+static int g_rt_opt[6] = { 4, 1, 1, 100, 1, 97 };   /* v9.98 光追配置：采样/弹射/细节/光晕/灯速/镜面 */
+typedef struct { float right[4]; float up[4]; float fwd[4]; float camPos[4]; float lightDir[4]; float light2[4]; float fov; int shadowOn; int bounces; float t; int rtOpt[4]; } RtPC;   /* v9.98: rtOpt[4]，去 _pad ⇒ 124 字节 ✓ */   /* v9.91: +light2 点光源 */   /* v9.69: 传相机基，不再用 invVP ✓ */
+static VkBuffer g_scBuf = VK_NULL_HANDLE, g_scIdx = VK_NULL_HANDLE;        /* v9.90 全局：S1a 写入 / S1b 绑定 跨函数共用 ✓ */
+static VkDeviceMemory g_scBufMem = VK_NULL_HANDLE, g_scIdxMem = VK_NULL_HANDLE;
 
 /* 直接构造「NDC→世界」矩阵（= 视投影的逆），避免写通用 4x4 求逆 ✓ */
 static void rt_inv_vp(float *m, float aspect, const float *eye, const float *fwd,
@@ -781,9 +847,29 @@ Java_com_dsh_gputest_MainActivity_nativeRtInit(JNIEnv *env, jobject th, jstring 
     }
     /* 网格 → 顶点/索引缓冲 */
     float *verts = NULL; uint32_t *idx = NULL; uint32_t ntri = 0;
-    if (!rt_make_mesh(c, &verts, &idx, &ntri)) { ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx)); return (*env)->NewStringUTF(env, "网格生成失败"); }
-    int nv = 0; { /* 顶点数 = 球(RING+1)*(SEG+1) + 地面 4 */ nv = 13 * 25 + 4; }
+    uint32_t nvu = 0;
+    if (!rt_make_mesh(c, &verts, &idx, &ntri, &nvu)) { ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx)); return (*env)->NewStringUTF(env, "网格生成失败"); }
+    int nv = (int) nvu;   /* v9.83: 真顶点数（原来是硬编码 329 ✗ 导致箱子/房间越界 ✗）*/
     VkDeviceSize vsz = (VkDeviceSize) nv * 12, isz = (VkDeviceSize) ntri * 3 * 4;
+    /* v9.84 · S1a：场景数据进 SSBO —— 「唯一真源」第一步（本步不改画面 ✓ 为下一步 S1b 绑定铺路）*/
+    {
+        VkDeviceSize ssz = (VkDeviceSize) nv * 12, siz = (VkDeviceSize) ntri * 3 * 4;
+        if (mk_buf(c, ssz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g_scBuf, &g_scBufMem, 1) &&
+            mk_buf(c, siz, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &g_scIdx, &g_scIdxMem, 1)) {
+            PFN_vkMapMemory m1 = (PFN_vkMapMemory) c->gdpa(c->dev, "vkMapMemory");
+            PFN_vkUnmapMemory u1 = (PFN_vkUnmapMemory) c->gdpa(c->dev, "vkUnmapMemory");
+            void *p1 = NULL, *p2 = NULL;
+            int ok1 = (m1 && m1(c->dev, g_scBufMem, 0, VK_WHOLE_SIZE, 0, &p1) == VK_SUCCESS && p1);
+            int ok2 = (m1 && m1(c->dev, g_scIdxMem, 0, VK_WHOLE_SIZE, 0, &p2) == VK_SUCCESS && p2);
+            if (ok1) { memcpy(p1, verts, (size_t) ssz); u1(c->dev, g_scBufMem); }
+            if (ok2) { memcpy(p2, idx, (size_t) siz); u1(c->dev, g_scIdxMem); }
+            snprintf(out, sizeof(out), "场景 SSBO OK 顶点 %u 字节（%d 个）· 索引 %u 字节（%u 三角形）· 上传 %s%s",
+                     (unsigned) ssz, nv, (unsigned) siz, ntri, ok1 ? "顶点OK" : "顶点FAIL", ok2 ? " 索引OK" : " 索引FAIL");
+            LOG("%s%c", out, 10);   /* v9.85: 不用字面量格式串（-Wformat-security）+ 换行用 %c 避开反斜杠陷阱 */
+        } else {
+            LOG("%s", "场景 SSBO FAIL（创建失败，仅铺路，不影响渲染）");
+        }
+    }
     if (!mk_buf(c, vsz, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, &g_rtx.vbuf, &g_rtx.vMem, 1) ||
         !mk_buf(c, isz, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, &g_rtx.ibuf, &g_rtx.iMem, 1)) {
         free(verts); free(idx); ctx_close(c); memset(&g_rtx, 0, sizeof(g_rtx)); return (*env)->NewStringUTF(env, "顶点/索引缓冲失败"); }
@@ -864,7 +950,7 @@ Java_com_dsh_gputest_MainActivity_nativeRtInit(JNIEnv *env, jobject th, jstring 
     }
     g_rtx.ntri = ntri;
     g_rtx.ok = 1;
-    snprintf(out, sizeof(out), "光追就绪 ✓ BLAS 已建（%u 三角形 = 球 %d×%d + 地面）%dx%d",
+    snprintf(out, sizeof(out), "光追就绪 ✓ BLAS 已建（%u 三角形 = 箱 %d × 桶 %d + 镜面 + 房间）%dx%d   /* v10.3 修正过期描述 */",
              ntri, 12, 24, (int) w, (int) h);
     return (*env)->NewStringUTF(env, out);
 }
@@ -912,15 +998,18 @@ static int rt_build_tlas(Ctx *c) {
     void *p = NULL; mp(c->dev, g_rtx.instMem, 0, VK_WHOLE_SIZE, 0, &p);
     VkAccelerationStructureDeviceAddressInfoKHR dai = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR, .accelerationStructure = g_rtx.blas };
     VkDeviceAddress ba = asaddr(c->dev, &dai);
-    /* 手填 VkAccelerationStructureInstanceKHR（避免对其打包布局的依赖 ✓ 64 字节 ✓）*/
+    /* 手填 VkAccelerationStructureInstanceKHR —— v9.71 修正字节偏移：
+     *   transform=0..47 / customIndex|mask=48(u[12]) / off|flags=52(u[13]) / BLAS地址=56..63(u[14],u[15])
+     *   原先写成 u[16/4+0..3]=u[4..7]（字节 16..31）⇒ 全落进 transform 矩阵，
+     *   而**真正放 BLAS 地址的 56~63 一直是 0** ⇒ 实例指向空 ⇒ 光线全打空 ✗✗ */
     memset(p, 0, 64);
     float *f = (float *) p;
     f[0] = 1; f[5] = 1; f[10] = 1;                       /* 3x4 变换 = 单位矩阵 */
     uint32_t *u = (uint32_t *) p;
-    u[16 / 4 + 0] = 0xFF000000u;                          /* instanceCustomIndex:24 | mask:8 ⇒ mask=0xFF ✓ */
-    u[16 / 4 + 1] = 0;                                    /* instanceShaderBindingTableRecordOffset:24 | flags:8 */
-    u[16 / 4 + 2] = (uint32_t) (ba & 0xFFFFFFFFu);        /* accelerationStructureReference 低 32 位 */
-    u[16 / 4 + 3] = (uint32_t) (ba >> 32);                /* 高 32 位 */
+    u[12] = 0xFF000000u;                          /* instanceCustomIndex:24 | mask:8 ⇒ mask=0xFF ✓ */
+    u[13] = 0;                                    /* instanceShaderBindingTableRecordOffset:24 | flags:8 */
+    u[14] = (uint32_t) (ba & 0xFFFFFFFFu);        /* accelerationStructureReference 低 32 位 */
+    u[15] = (uint32_t) (ba >> 32);                /* 高 32 位 */
     um(c->dev, g_rtx.instMem);
     VkAccelerationStructureGeometryKHR g; memset(&g, 0, sizeof(g));
     g.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
@@ -972,17 +1061,22 @@ static int rt_mk_pipeline(Ctx *c) {
     PFN_vkCreatePipelineLayout mkpl = (PFN_vkCreatePipelineLayout) c->gdpa(c->dev, "vkCreatePipelineLayout");
     PFN_vkCreateComputePipelines mkcp = (PFN_vkCreateComputePipelines) c->gdpa(c->dev, "vkCreateComputePipelines");
     if (!mksh || !mkdl || !mkdp || !ads || !uds || !mkpl || !mkcp) return 0;
-    VkDescriptorSetLayoutBinding b[2];
+    VkDescriptorSetLayoutBinding b[4];   /* v9.89 S1b: +b2 顶点SSBO +b3 索引SSBO */
     memset(b, 0, sizeof(b));
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutCreateInfo dl = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b };
+    b[2].binding = 2; b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[2].descriptorCount = 1; b[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[3].binding = 3; b[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[3].descriptorCount = 1; b[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo dl = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 4, .pBindings = b };
     if (mkdl(c->dev, &dl, NULL, &g_rtx.dsl) != VK_SUCCESS) return 0;
-    VkDescriptorPoolSize ps[2] = {
-        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 } };
-    VkDescriptorPoolCreateInfo dp = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2, .pPoolSizes = ps };
+    VkDescriptorPoolSize ps[3] = {
+        { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 } };
+    VkDescriptorPoolCreateInfo dp = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 3, .pPoolSizes = ps };
     if (mkdp(c->dev, &dp, NULL, &g_rtx.dpool) != VK_SUCCESS) return 0;
     VkDescriptorSetAllocateInfo da = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_rtx.dpool, .descriptorSetCount = 1, .pSetLayouts = &g_rtx.dsl };
     if (ads(c->dev, &da, &g_rtx.dset) != VK_SUCCESS) return 0;
@@ -990,14 +1084,20 @@ static int rt_mk_pipeline(Ctx *c) {
     wa.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
     wa.accelerationStructureCount = 1; wa.pAccelerationStructures = &g_rtx.tlas;
     VkDescriptorImageInfo ii = { .imageView = g_rtx.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
-    VkWriteDescriptorSet w[2]; memset(w, 0, sizeof(w));
+    VkWriteDescriptorSet w[4]; memset(w, 0, sizeof(w));
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].pNext = &wa;
     w[0].dstSet = g_rtx.dset; w[0].dstBinding = 0; w[0].descriptorCount = 1;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     w[1].dstSet = g_rtx.dset; w[1].dstBinding = 1; w[1].descriptorCount = 1;
     w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &ii;
-    uds(c->dev, 2, w, 0, NULL);
+    VkDescriptorBufferInfo bi2; bi2.buffer = g_scBuf; bi2.offset = 0; bi2.range = VK_WHOLE_SIZE;
+    VkDescriptorBufferInfo bi3; bi3.buffer = g_scIdx; bi3.offset = 0; bi3.range = VK_WHOLE_SIZE;
+    w[2].dstSet = g_rtx.dset; w[2].dstBinding = 2; w[2].descriptorCount = 1;
+    w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[2].pBufferInfo = &bi2;
+    w[3].dstSet = g_rtx.dset; w[3].dstBinding = 3; w[3].descriptorCount = 1;
+    w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[3].pBufferInfo = &bi3;
+    uds(c->dev, 4, w, 0, NULL);
     VkShaderModuleCreateInfo sm = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = rt_comp_spv_len * 4, .pCode = rt_comp_spv };
     VkShaderModule mod = NULL;
@@ -1044,10 +1144,41 @@ Java_com_dsh_gputest_MainActivity_nativeRtFrame(JNIEnv *env, jobject th) {
     RtPC k; memset(&k, 0, sizeof(k));
     float eye[3] = { 3.2f, 2.4f, 3.2f };
     float fwd[3] = { -0.62f, -0.42f, -0.62f }, right[3] = { 0.707f, 0.0f, -0.707f }, up[3] = { 0, 1, 0 };
-    rt_inv_vp(k.invVP, (float) g_rtx.w / (float) g_rtx.h, eye, fwd, right, up, 1.0f);
+    /* v9.69: 直接传相机基（与已验证能出图的迷你 3D 同一套射线公式）✓ */
+    /* v9.80 · 相机绕行（室内环绕，游戏实机感）：半径 2.8 m 在房间里绕，看向 (0,0.8,0) ✓ */
+    {
+        float ang = (float) fmod(now_ms(), 20000.0) / 20000.0f * 6.2831853f;   /* v9.81: now_ms 返回 double，取模要用 fmod ✓ */
+        float ex = 2.8f * sinf(ang), ez = 2.8f * cosf(ang), ey = 2.3f;
+        float tx = 0.0f - ex, ty = 0.85f - ey, tz = 0.0f - ez;
+        float len = sqrtf(tx*tx + ty*ty + tz*tz); if (len < 1e-4f) len = 1e-4f;
+        eye[0] = ex; eye[1] = ey; eye[2] = ez;
+        fwd[0] = tx/len; fwd[1] = ty/len; fwd[2] = tz/len;
+        right[0] = fwd[1]*0.0f - fwd[2]*1.0f; right[1] = fwd[2]*0.0f - fwd[0]*0.0f; right[2] = fwd[0]*1.0f - fwd[1]*0.0f;
+        len = sqrtf(right[0]*right[0] + right[1]*right[1] + right[2]*right[2]); if (len < 1e-4f) len = 1e-4f;
+        right[0] /= len; right[1] /= len; right[2] /= len;
+        up[0] = right[1]*fwd[2] - right[2]*fwd[1];
+        up[1] = right[2]*fwd[0] - right[0]*fwd[2];
+        up[2] = right[0]*fwd[1] - right[1]*fwd[0];
+    }
+    memcpy(k.right, right, 12); k.right[3] = 0.0f;
+    memcpy(k.up, up, 12); k.up[3] = 0.0f;
+    memcpy(k.fwd, fwd, 12); k.fwd[3] = 0.0f;
+    k.fov = 1.0f;
     memcpy(k.camPos, eye, 12); k.camPos[3] = 1.0f;
     k.lightDir[0] = 0.5f; k.lightDir[1] = 1.0f; k.lightDir[2] = 0.3f; k.lightDir[3] = 0.0f;
+    /* v9.95 · 灯在房间里移动（实时渲染的关键证据：阴影/反射逐帧变化 ✓）*/
+    {
+        float la = (float) fmod(now_ms(), 12000.0) / 12000.0f * 6.2831853f;
+        k.light2[0] = 2.6f * cosf(la);
+        k.light2[1] = 2.7f + 0.7f * sinf(la * 2.0f);     /* 上下轻微起伏 */
+        k.light2[2] = 2.6f * sinf(la);
+        k.light2[3] = 2.2f;                              /* 强度 */
+    }
     k.shadowOn = g_lit.shadows; k.bounces = g_lit.passesPerFrame; k.t = (float) (now_ms() / 1000.0);
+    k.rtOpt[0] = g_rt_opt[0] > 0 ? g_rt_opt[0] : 1;   /* 阴影采样数 */
+    k.rtOpt[1] = g_rt_opt[1];                        /* 反射弹射 0/1/2 */
+    k.rtOpt[2] = (g_rt_opt[2] & 1) | ((g_rt_opt[5] & 0xFF) << 8);   /* bit0 细节, bit8-15 镜面% */
+    k.rtOpt[3] = g_rt_opt[3];                        /* 光晕 % */
     VkCommandBufferBeginInfo bi2 = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     double t0 = now_ms();
     if (bcb(g_rtx.cb, &bi2) != VK_SUCCESS) return (*env)->NewStringUTF(env, "X begin 失败");
@@ -1087,6 +1218,7 @@ Java_com_dsh_gputest_MainActivity_nativeRtBlit(JNIEnv *env, jobject th, jobject 
     if (AndroidBitmap_getInfo(env, bmp, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return (*env)->NewStringUTF(env, "取位图信息失败");
     void *pix = NULL;
     if (AndroidBitmap_lockPixels(env, bmp, &pix) != ANDROID_BITMAP_RESULT_SUCCESS) return (*env)->NewStringUTF(env, "锁定位图失败");
+    double pmin = -1, pmax = -1, pavg = -1;   /* v9.65 */
     PFN_vkMapMemory mp = (PFN_vkMapMemory) g_rtx.ctx.gdpa(g_rtx.ctx.dev, "vkMapMemory");
     PFN_vkUnmapMemory um = (PFN_vkUnmapMemory) g_rtx.ctx.gdpa(g_rtx.ctx.dev, "vkUnmapMemory");
     void *src = NULL;
@@ -1097,10 +1229,28 @@ Java_com_dsh_gputest_MainActivity_nativeRtBlit(JNIEnv *env, jobject th, jobject 
             uint8_t *dst = (uint8_t *) pix + (size_t) y * info.stride;
             memcpy(dst, (const uint8_t *) src + (size_t) y * g_rtx.w * 4, (size_t) cw * 4);
         }
+        {
+            unsigned char *sb = (unsigned char *) src;
+            size_t tot = (size_t) g_rtx.w * g_rtx.h * 4, sum = 0, cnt = 0;
+            int mn = 255, mx = 0;
+            for (size_t i = 0; i < tot; i += 64) {
+                int v = sb[i];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                sum += (size_t) v; cnt++;
+            }
+            if (cnt) { pmin = mn; pmax = mx; pavg = (double) sum / (double) cnt; }
+        }
         um(g_rtx.ctx.dev, g_rtx.rMem);
     }
     AndroidBitmap_unlockPixels(env, bmp);
-    return (*env)->NewStringUTF(env, "已拷入位图");
+    {
+        char o2[256];
+        if (pmin < 0) snprintf(o2, sizeof(o2), "X 回读映射失败（vkMapMemory 未成功）");
+        else snprintf(o2, sizeof(o2), "已拷入位图 · 像素 min %.0f/max %.0f/均 %.1f · 位图 %dx%d",
+                      pmin, pmax, pavg, (int) info.width, (int) info.height);
+        return (*env)->NewStringUTF(env, o2);
+    }
 }
 
 JNIEXPORT jstring JNICALL
@@ -3306,6 +3456,15 @@ JNIEXPORT jint JNICALL Java_com_dsh_gputest_MainActivity_nativeMini3DInit(JNIEnv
     g_m3d.ok = 1;
     LOG("mini3d: 就绪 ✓ %dx%d（颜色 R8G8B8A8 + 深度 D32，独立管线/命令池）\n", (int) w, (int) h);
     return 1;
+}
+
+JNIEXPORT void JNICALL Java_com_dsh_gputest_MainActivity_nativeRtSettings(JNIEnv *env, jobject th,
+        jint samples, jint bounce, jint detail, jint bloomPct, jint lightMove, jint mirrorPct) {
+    (void) env; (void) th;
+    g_rt_opt[0] = samples; g_rt_opt[1] = bounce; g_rt_opt[2] = detail;
+    g_rt_opt[3] = bloomPct; g_rt_opt[4] = lightMove; g_rt_opt[5] = mirrorPct;
+    snprintf(g_log + g_len, sizeof(g_log) - g_len, "光追配置 -> 采样=%d 弹射=%d 细节=%d 光晕=%d 灯速=%d 镜面=%d", samples, bounce, detail, bloomPct, lightMove, mirrorPct);
+    LOG("%s", "\n");
 }
 
 JNIEXPORT void JNICALL Java_com_dsh_gputest_MainActivity_nativeMini3DSettings(JNIEnv *env, jobject th, jint shadows, jint pcf, jint res, jint bloom, jint tonemap, jint animate, jint passes) {

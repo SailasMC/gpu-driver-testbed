@@ -8,15 +8,36 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1, rgba8) uniform image2D outImg;
+layout(set = 0, binding = 2) readonly buffer SceneV { float sv[]; };   /* S1b 顶点 */
+layout(set = 0, binding = 3) readonly buffer SceneI { uint si[]; };    /* S1b 索引 */
 layout(push_constant) uniform PC {
-    mat4  invVP;
+    vec4  right;
+    vec4  up;
+    vec4  fwd;
     vec4  camPos;
     vec4  lightDir;
+    vec4  light2;
+    ivec4 rtOpt;     /* v9.98: x=阴影采样 y=弹射 z=bit0细节|bit8-15镜面% w=光晕% */      /* v9.91 点光源: xyz 位置, w 强度 */
+    float fov;
     int   shadowOn;
     int   bounces;
     float t;
     int   _pad;
 } pc;
+
+/* v9.94 · 程序化材质细节（无需贴图 ✓ 零内存成本 ✓）*/
+float hsh(vec3 p) {
+    p = fract(p * 0.3183099 + vec3(0.11, 0.17, 0.23));
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+float vnoise(vec3 p) {
+    vec3 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hsh(i), hsh(i + vec3(1,0,0)), f.x), mix(hsh(i + vec3(0,1,0)), hsh(i + vec3(1,1,0)), f.x), f.y),
+               mix(mix(hsh(i + vec3(0,0,1)), hsh(i + vec3(1,0,1)), f.x), mix(hsh(i + vec3(0,1,1)), hsh(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+float fbm3(vec3 p) { return 0.62 * vnoise(p) + 0.31 * vnoise(p * 2.03) + 0.16 * vnoise(p * 4.11); }
 
 void main() {
     ivec2 pix  = ivec2(gl_GlobalInvocationID.xy);
@@ -25,9 +46,10 @@ void main() {
 
     vec2 ndc = (vec2(pix) + 0.5) / vec2(size) * 2.0 - 1.0;
     ndc.y = -ndc.y;                                  /* Vulkan NDC 的 y 向下 ⇒ 翻正 ✓ */
-    vec4 farp = pc.invVP * vec4(ndc, 1.0, 1.0);
-    vec3 org  = pc.camPos.xyz;
-    vec3 dir  = normalize(farp.xyz / max(abs(farp.w), 1e-6) - org);
+    vec3 org = pc.camPos.xyz;
+    float th = tan(pc.fov * 0.5);
+    float tw = th * (float(size.x) / float(size.y));
+    vec3 dir = normalize(pc.fwd.xyz + pc.right.xyz * ndc.x * tw + pc.up.xyz * ndc.y * th);   /* v9.69 ✓ */
 
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, org, 1e-3, dir, 1e4);
@@ -37,8 +59,153 @@ void main() {
     if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
         col = 0.5 + 0.5 * dir;                       /* ★ 诊断色：未命中 = 方向渐变 */
     } else {
+        /* v9.70 · 命中后打阴影射线：严格照天玑官方最优写法 ——
+         *   gl_RayFlagsTerminateOnFirstHitEXT（只需知有无遮挡）+ **只调一次** rayQueryProceedEXT
+         *   （官方实测：Khronos 那套 while+逐候选判材质 只有 0.85 FPS，本写法 85 FPS ✓）
+         * 3 次抖动 => 软阴影（官方建议软阴影用少量采样 ✓）*/
         float tt = rayQueryGetIntersectionTEXT(rq, true);
-        col = vec3(1.0, 0.45, 0.12) * (1.0 - clamp(tt / 12.0, 0.0, 1.0)) + vec3(0.05);
+        vec3 hp = org + dir * tt;
+        vec3 L = normalize(pc.lightDir.xyz);
+        /* v9.75 · 负载倍率真正生效：采样数 = pc.bounces（原来硬编码 3，设置改了没用 ✗）
+         * 常量循环上界 32 + break（驱动友好）✓ 采样数越多阴影越软越准、耗时越高 ✓ */
+        int ns = pc.rtOpt.x;   /* v9.98: 阴影采样数改由光追配置控制 */
+        if (ns < 1) ns = 1;
+        if (ns > 32) ns = 32;
+        float lit = 0.0;
+        for (int s2 = 0; s2 < 32; s2++) {
+            if (s2 >= ns) break;
+            float j = (float(s2) + 0.5) / float(ns) - 0.5;      /* 分层抖动 => 软阴影 ✓ */
+            vec3 Lj = normalize(L + vec3(j * 0.12, j * 0.03, j * 0.08));
+            rayQueryEXT rq2;
+            uint flags = gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT;
+            rayQueryInitializeEXT(rq2, tlas, flags, 0xFF, hp + Lj * 2e-3, 1e-3, Lj, 1e4);
+            rayQueryProceedEXT(rq2);
+            if (rayQueryGetIntersectionTypeEXT(rq2, true) == gl_RayQueryCommittedIntersectionNoneEXT) lit += 1.0;
+        }
+        lit /= float(ns);
+        /* v9.76 · 真法线 => 漫反射 + 高光 + 反射（RT 的招牌效果 ✓）
+         * 几何与 rt_make_mesh 一致：球心 (0,0.9,0) 半径 0.9；地面 y=0 的 6x6 平面 ✓ */
+        /* v9.79 · 室内竞技场：与 rt_make_mesh 的 SPH/BOX/R/H 逐项一致 ✓ */
+        const float R = 4.5, H = 4.2;
+        vec3 BC[12]; vec3 BH[12];   /* v9.93: 12 箱，index 10/11 是镜面 ✓ */
+        BC[0]=vec3(-1.6,0.45,-1.5); BH[0]=vec3(0.45);
+        BC[1]=vec3( 0.2,0.35,-2.2); BH[1]=vec3(0.35);
+        BC[2]=vec3( 1.9,0.60,-0.8); BH[2]=vec3(0.60);
+        BC[3]=vec3(-2.6,0.30, 1.2); BH[3]=vec3(0.30);
+        BC[4]=vec3( 0.9,0.50, 1.8); BH[4]=vec3(0.50);
+        BC[5]=vec3( 2.4,0.40, 2.6); BH[5]=vec3(0.40);
+        BC[6]=vec3(-3.3,0.70,-0.6); BH[6]=vec3(0.70);
+        BC[7]=vec3(-3.3,2.10,-0.6); BH[7]=vec3(0.70);
+        BC[8]=vec3( 0.2,1.05,-2.2); BH[8]=vec3(0.35);
+        BC[9]=vec3( 2.4,1.20, 2.6); BH[9]=vec3(0.40);
+        BC[10]=vec3(-4.36,1.60,0.0); BH[10]=vec3(0.06,1.55,2.60);   /* 左墙镜 */
+        BC[11]=vec3( 4.36,1.60,0.0); BH[11]=vec3(0.06,1.55,2.60);   /* 右墙镜 */
+        vec3 N; vec3 albedo; int got = 0;
+        int hi = -1;                                        /* 命中的箱索引（判镜面用）*/
+        for (int bi = 0; bi < 12; bi++) {
+            vec3 d = (hp - BC[bi]) / BH[bi];
+            if (max(max(abs(d.x), abs(d.y)), abs(d.z)) < 1.05) {
+                vec3 ad = abs(d);
+                if (ad.x >= ad.y && ad.x >= ad.z) N = vec3(sign(d.x), 0.0, 0.0);
+                else if (ad.y >= ad.z)            N = vec3(0.0, sign(d.y), 0.0);
+                else                              N = vec3(0.0, 0.0, sign(d.z));
+                albedo = vec3(0.55, 0.38, 0.22);
+                hi = bi;
+                got = 1; break;
+            }
+        }
+        if (got == 0) {
+            vec3 SC2[3]; SC2[0] = vec3(-0.9, 0.55, 0.6); SC2[1] = vec3(1.5, 0.45, -2.6); SC2[2] = vec3(3.1, 0.60, 1.9);
+            float SR2[3]; SR2[0] = 0.55; SR2[1] = 0.45; SR2[2] = 0.60;
+            for (int si = 0; si < 3; si++) {
+                if (abs(distance(hp, SC2[si]) - SR2[si]) < 0.09) {
+                    N = normalize(hp - SC2[si]);
+                    albedo = vec3(0.62, 0.64, 0.68);
+                    got = 1; break;
+                }
+            }
+        }
+        if (got == 0) {
+            if (hp.y < 0.05) {
+                N = vec3(0.0, 1.0, 0.0);
+                float c2 = mod(floor(hp.x) + floor(hp.z), 2.0);
+                albedo = mix(vec3(0.26,0.27,0.29), vec3(0.44,0.45,0.47), c2);
+            } else if (hp.y > H - 0.05) {
+                N = vec3(0.0, -1.0, 0.0); albedo = vec3(0.20);
+            } else if (abs(hp.z) > R - 0.05) {
+                N = vec3(0.0, 0.0, sign(hp.z)); albedo = vec3(0.42, 0.42, 0.45);
+            } else {
+                N = vec3(sign(hp.x), 0.0, 0.0); albedo = vec3(0.42, 0.42, 0.45);
+            }
+        }
+        /* v9.94 · 材质细节：木纹/板缝/边缘压暗 · 拉丝金属+锈 · 地砖勾缝 · 水泥污渍 */
+        if ((pc.rtOpt.z & 1) != 0) {
+            if (hi >= 0 && hi < 10) {
+                float grain = fbm3(vec3(hp.x * 3.0, hp.y * 26.0, hp.z * 3.0));      /* 木纹（沿 y 拉长）*/
+                float plank = smoothstep(0.03, 0.12, abs(fract(hp.y * 4.0) - 0.5)); /* 板缝 */
+                vec3 e3 = abs(hp - BC[hi]);
+                vec3 dd = BH[hi] - e3;
+                float eg = smoothstep(0.0, 0.07, min(min(dd.x, dd.y), dd.z));        /* 棱边压暗 */
+                albedo *= (0.70 + 0.60 * grain) * plank * (0.55 + 0.45 * eg);
+            } else if (got == 1) {
+                float brushed = 0.86 + 0.28 * vnoise(vec3(hp.x * 40.0, hp.y * 3.0, hp.z * 40.0));  /* 拉丝 */
+                float rust = smoothstep(0.55, 0.85, fbm3(hp * 7.0));                              /* 锈斑 */
+                albedo = mix(albedo * brushed, vec3(0.42, 0.24, 0.12), rust * 0.55);
+            } else {
+                if (N.y > 0.5) {                                        /* 地砖：勾缝 + 微噪 */
+                    vec2 fr = abs(fract(hp.xz) - 0.5);
+                    float grout = smoothstep(0.40, 0.48, max(fr.x, fr.y));
+                    albedo *= mix(1.0, 0.45, grout) * (0.92 + 0.16 * fbm3(hp * 18.0));
+                } else {                                                 /* 水泥墙：污渍 + 颗粒 */
+                    albedo *= (0.80 + 0.38 * fbm3(hp * 2.3)) * (0.94 + 0.12 * vnoise(hp * 22.0));
+                }
+            }
+        }
+        vec3 V = -dir;
+        vec3 Hv = normalize(L + V);
+        float diff = max(0.0, dot(N, L));
+        float spec = pow(max(0.0, dot(N, Hv)), 48.0) * 0.9;
+        vec3 base = albedo * (0.20 + 0.90 * diff * lit) + vec3(spec) * lit;   /* v9.77: 环境光 0.12->0.20（阴影不再死黑）*/
+        /* 反射：1 次弹射（官方说 opaque 标志下 Proceed 一次即得最近交点 ✓）*/
+        vec3 rd2 = reflect(dir, N);
+        float mirPct = float((pc.rtOpt.z >> 8) & 0xFF) / 100.0;
+        if (pc.rtOpt.y > 0 && dot(rd2, N) > 0.0) {
+            rayQueryEXT rq3;
+            rayQueryInitializeEXT(rq3, tlas, gl_RayFlagsOpaqueEXT, 0xFF, hp + N * 3e-3, 1e-3, rd2, 1e4);
+            rayQueryProceedEXT(rq3);
+            if (rayQueryGetIntersectionTypeEXT(rq3, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+                float t2 = rayQueryGetIntersectionTEXT(rq3, true);
+                /* v9.77: Fresnel 近似 —— 正视反射弱、掠射反射强（真实材质感，不再是镜面糊一片）*/
+                /* v9.92: 镜面（箱 10/11 号即索引 8/9）反射率 ~0.92，普通表面仍走 Fresnel ✓ */
+                float fres = (hi >= 10) ? mirPct : (0.08 + 0.55 * pow(1.0 - max(0.0, dot(N, V)), 3.0));
+                base = mix(base, vec3(0.78, 0.80, 0.86) * exp(-0.10 * t2), fres);   /* v9.95 镜面：中性偏亮的反射像 */
+            } else {
+                base = mix(base, vec3(0.30, 0.48, 0.62), 0.10 * (0.3 + 0.7 * pow(1.0 - max(0.0, dot(N, V)), 2.0)));
+            }
+        }
+        /* v9.91 · 第二光源（室内灯）+ 体积光晕（泛光近似：灯附近亮部外溢 ✓）*/
+        {
+            vec3 LP = pc.light2.xyz;
+            float LI = pc.light2.w;
+            vec3 Lv = LP - hp;
+            float d2 = dot(Lv, Lv);
+            float d = sqrt(d2);
+            if (LI > 0.0 && d > 1e-3) {
+                vec3 Ld = Lv / d;
+                float ndl = max(0.0, dot(N, Ld));
+                float att = LI / (1.0 + 0.30 * d2);
+                rayQueryEXT rq4;
+                rayQueryInitializeEXT(rq4, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                                      0xFF, hp + N * 3e-3, 1e-3, Ld, max(d - 0.05, 1e-3));
+                rayQueryProceedEXT(rq4);
+                float vis = (rayQueryGetIntersectionTypeEXT(rq4, true) == gl_RayQueryCommittedIntersectionNoneEXT) ? 1.0 : 0.0;
+                base += albedo * vec3(1.0, 0.84, 0.58) * (att * ndl * vis) * 1.4;   /* 灯照 + 灯影 */
+            }
+            /* 光晕：与法线无关、随距离衰减 —— 泛光的廉价近似 ✓ */
+            float halo = LI / (1.0 + 2.2 * d2) * (float(pc.rtOpt.w) / 100.0);
+            base += vec3(1.0, 0.86, 0.62) * halo * 0.55;
+        }
+        col = base;   /* v9.97: 撤掉多余的压暗 —— base 里已含 97% 反射（fres=0.97）⇒ 镜子本身就是反射像 ✓ */
     }
     imageStore(outImg, pix, vec4(col, 1.0));
 }

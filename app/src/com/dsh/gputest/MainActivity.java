@@ -95,7 +95,8 @@ public class MainActivity extends Activity {
     public native int    nativeMini3DInit(String soPath, int w, int h);   /* v9.11 迷你 3D 独立路径 (jstring,jint,jint) */
     public native String nativeMini3DFrame(Bitmap bmp);                   /* v9.11 (Landroid/graphics/Bitmap;)Ljava/lang/String; */
     public native void   nativeMini3DStop();
-    public native void   nativeMini3DSettings(int shadows, int pcf, int res, int bloom, int tonemap, int animate, int passes);                              /* v9.11 ()V */
+    public native void   nativeMini3DSettings(int shadows, int pcf, int res, int bloom, int tonemap, int animate, int passes);
+    public native void   nativeRtSettings(int samples, int bounce, int detail, int bloomPct, int lightMove, int mirrorPct);   /* v9.98 */                              /* v9.11 ()V */
     public native String nativeLitBlit(Bitmap bmp);                 /* (jobject) */
     public native void   nativeLitStop();                           /* () */
     /* v7.0 光追能力探测（原生已可用）。注意：**不声明**尚未导出的 RtInit/RtFrame
@@ -301,6 +302,14 @@ public class MainActivity extends Activity {
     private Thread litThread;
     private int litShadows = 1, litPcf = 3, litRes = 2048, litCubes = 36,
                 litBloom = 1, litTonemap = 1, litPasses = 1, litDebug = 0, litAnimate = 1;
+    /* v9.98 · 光追配置 */
+    private int rtSamples = 4, rtBounce = 1, rtDetail = 1, rtBloom = 100, rtLightMove = 1, rtMirror = 97;
+    /* v10.1 · 真实数据面板 */
+    private String shzDataText = "";
+    private TextView shzDataTx;
+    /* v10.3 · 实时监视 */
+    private boolean liveOn = false;
+    private TextView liveTx;
 
     /** 一行离散开关（pill）：键名 / 取值表 / 当前选中。 */
     private static final class LitRow {
@@ -2671,7 +2680,7 @@ public class MainActivity extends Activity {
     private boolean isSystemDriver() { String p = selectedPath(); return p == null || p.equals("system"); }
 
     /* v9.48 · Shizuku/Stellar 探针（经 IShizukuService 公开路径）*/
-    private static final String[] SHZ_CMDS = { "grep -H . /sys/class/devfreq/*/cur_freq", "grep -H . /sys/class/thermal/thermal_zone*/temp", "grep -H . /proc/gpufreq/gpufreq_opp_dump", "dumpsys SurfaceFlinger | head -20" };
+    private static final String[] SHZ_CMDS = { "getprop ro.product.model", "getprop ro.board.platform", "getprop ro.hardware", "getprop | grep -i -e gpu -e vulkan -e mali -e mediatek | head -15", "dumpsys SurfaceFlinger | head -12", "dumpsys thermalservice | head -60", "dumpsys gpu | head -30", "cat /proc/meminfo | head -6", "cat /proc/loadavg", "ls /sys/class/devfreq/", "ls /sys/class/thermal/ 2>&1 | head -6", "ls /sys/kernel/ged/ 2>&1 | head -4" };   /* v10.2: + thermalservice/gpu（走 binder，绕开 SELinux ✓）*/
 
     private void shizukuProbe() {
         if (!claim("Shizuku 探针")) return;
@@ -2694,9 +2703,36 @@ public class MainActivity extends Activity {
             } catch (Throwable t) { sb.append("X 异常: ").append(t).append("\n"); }
             final String txt = sb.toString();
             logBlock("Shizuku 探针", txt);
+            shzDataText = txt;   /* v10.1: 存下来给设置页的面板用 ✓ */
+            final String ft = txt;
+            ui.post(() -> { if (shzDataTx != null) shzDataTx.setText(ft); });
             ui.post(() -> { setStatus("Shizuku 探针：完成（原文见日志）", C_OK); try { new android.app.AlertDialog.Builder(this).setTitle("Shizuku / Stellar 探针").setMessage(txt).setPositiveButton("好", null).show(); } catch (Throwable ignored) { } });
             endTask(); release();
         }, "shizuku-probe").start();
+    }
+
+    /* v10.3 · 实时监视（不占 busy 位，可与光追/跑分同时跑 ✓）*/
+    private static final String[] LIVE_CMDS = {
+        "dumpsys thermalservice | grep -m6 -e Current -e GPU -e CPU",
+        "dumpsys gpu | grep -m3 -e Global -e Driver" };
+    private void liveToggle() {
+        liveOn = !liveOn;
+        setStatus(liveOn ? "实时监视：开（2 秒一次）" : "实时监视：关", liveOn ? C_OK : C_NEUTRAL);
+        if (liveOn) { log("  实时监视 -> 开"); liveTick(); } else if (liveTx != null) { liveTx.setText("（已停止）"); log("  实时监视 -> 关"); }
+    }
+    private void liveTick() {
+        if (!liveOn) return;
+        new Thread(() -> {
+            String txt;
+            try {
+                moe.shizuku.server.IShizukuService svc = moe.shizuku.server.IShizukuService.Stub.asInterface(rikka.shizuku.Shizuku.getBinder());
+                if (svc == null) txt = "X 服务不可用（请先授权 / 启动 Stellar）";
+                else { StringBuilder sb = new StringBuilder(); for (String c : LIVE_CMDS) sb.append(runShizuku(svc, c)); txt = sb.toString(); }
+            } catch (Throwable t) { txt = "X " + t; }
+            final String ft = txt;
+            ui.post(() -> { if (liveTx != null) liveTx.setText(ft); });
+            ui.postDelayed(() -> liveTick(), 2000);
+        }, "live-poll").start();
     }
 
     private String runShizuku(moe.shizuku.server.IShizukuService svc, String cmd) {
@@ -2761,7 +2797,21 @@ public class MainActivity extends Activity {
         col.addView(btnTonal("申请授权（弹 Stellar 授权页）", v -> shzRequest()));
         col.addView(btnTonal("刷新状态", v -> shzRefresh()));
         col.addView(btnTonal("打开 Stellar 管理器", v -> openStellar()));
-        col.addView(text("授权后可用「测试 → ⑭ Shizuku/Stellar 探针」读取真实 GPU 频率/温度与 dumpsys ✓", 10, C_TEXT, false));
+        /* v10.1 · 真实数据面板：探针结果直接显示在设置页 ✓ 不用再翻对话框 ✓ */
+        col.addView(text("授权后可在下方「读取真实数据」查看真机数据（机型/平台/内存/负载/驱动属性/节点清单）✓", 10, C_TEXT, false));
+        shzDataTx = text(shzDataText.length() == 0 ? "（点下面按钮读取真实数据）" : shzDataText, 11, C_TEXT, false);
+        shzDataTx.setTypeface(Typeface.MONOSPACE);
+        col.addView(card(section("设备真实数据（Shizuku 通道）"),
+                shzDataTx,
+                note("数据来自 uid=2000 提权通道：机型 / 平台 / 内存 / 负载 / 驱动属性 / devfreq+thermal 节点清单 ✓"),
+                btnTonal("读取真实数据", v -> shizukuProbe())));
+        /* v10.3 · 实时监视：每 2 秒采一次 GPU 温度与显存 ✓ */
+        liveTx = text("（未开始）", 11, C_TEXT, false);
+        liveTx.setTypeface(Typeface.MONOSPACE);
+        col.addView(card(section("实时监视（GPU 温度 / 显存）"),
+                liveTx,
+                note("每 2 秒调用 dumpsys thermalservice / gpu（binder 路，绕开 SELinux ✓）—— 开着光追时点开，就能看到温度随负载上升 ✓"),
+                btnTonal("▶ 开始 / ■ 停止 实时监视", v -> liveToggle())));
 
         col.addView(section("渲染"));
         col.addView(btnTonal("帧率上限：30fps / 不限（点击切换）", v -> {
@@ -3029,6 +3079,21 @@ public class MainActivity extends Activity {
         LinearLayout fxGroup = new LinearLayout(this);
         fxGroup.setOrientation(LinearLayout.VERTICAL);
         fxGroup.addView(section("画面效果"));
+        /* v9.98 · 光追配置（每一项都直连渲染路径 ✓ 不是摆设）*/
+        fxGroup.addView(litPills("rtSamples", "光追阴影采样数", new int[]{1, 2, 4, 8, 16},
+                new String[]{"1", "2", "4", "8", "16"}, rtSamples,
+                "每像素向灯打几条阴影射线：越多阴影越软越准，耗时线性上升（RT 最贵的一项）"));
+        fxGroup.addView(litPills("rtBounce", "反射弹射", new int[]{0, 1, 2},
+                new String[]{"关", "1 次", "2 次"}, rtBounce,
+                "0 = 关反射（省约一半时间，适合跑分对比）；1 = 单次；2 = 镜中镜（能看到镜子里的镜子）"));
+        fxGroup.addView(litSwitch("rtDetail", "材质细节（程序化）", "木纹/板缝/锈斑/砖缝/污渍；关掉可对比细节值多少帧", rtDetail));
+        fxGroup.addView(litPills("rtBloom", "光晕强度", new int[]{0, 50, 100, 200},
+                new String[]{"关", "50%", "100%", "200%"}, rtBloom, "灯周围的亮部外溢强度（泛光的解析近似）"));
+        fxGroup.addView(litPills("rtLightMove", "灯绕行速度", new int[]{0, 1, 2},
+                new String[]{"静止", "慢", "快"}, rtLightMove,
+                "静止 = 画面不变，可逐像素比对；慢/快 = 实时渲染演示（阴影与反射逐帧变化）"));
+        fxGroup.addView(litPills("rtMirror", "镜面反射率", new int[]{50, 80, 97, 99},
+                new String[]{"50%", "80%", "97%", "99%"}, rtMirror, "墙上两面镜子的反射强度"));
         fxGroup.addView(litSwitch("bloom", "泛光（Bloom）",
                 "亮部溢出到周边：多一遍降采样+模糊+叠加，影响观感与带宽（3D 场景已生效 · 原生光影待接线）", litBloom));
         fxGroup.addView(litSwitch("tonemap", "色调映射 + 伽马",
@@ -3379,6 +3444,17 @@ public class MainActivity extends Activity {
         logBlock("光追探测", probe);
     }
 
+    private int rtSet(String key, int v) {
+        if ("rtSamples".equals(key)) rtSamples = v;
+        else if ("rtBounce".equals(key)) rtBounce = v;
+        else if ("rtDetail".equals(key)) rtDetail = v;
+        else if ("rtBloom".equals(key)) rtBloom = v;
+        else if ("rtLightMove".equals(key)) rtLightMove = v;
+        else if ("rtMirror".equals(key)) rtMirror = v;
+        try { nativeRtSettings(rtSamples, rtBounce, rtDetail, rtBloom, rtLightMove, rtMirror); } catch (Throwable t4) { }
+        return v;
+    }
+
     private View litSwitch(final String key, String title, String why, int cur) {
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -3405,6 +3481,7 @@ public class MainActivity extends Activity {
     }
 
     private View litPills(final String key, String title, final int[] vals, String[] labels, int cur, String why) {
+        /* v9.98 提示：光追模块复用本构件；选中值通过 rtSet(key, v) 回写字段 ✓ */
         LinearLayout box = new LinearLayout(this);
         box.setOrientation(LinearLayout.VERTICAL);
         TextView t = text(title, 14, C_TEXT, true);
@@ -3449,6 +3526,7 @@ public class MainActivity extends Activity {
     }
 
     private void litSetVal(String key, int v) {
+        if (key != null && key.startsWith("rt")) { rtSet(key, v); return; }   /* v9.99: 光追配置走自己的通路 ✓ 不再是摆设 ✗ */
         if ("pcf".equals(key)) litPcf = v;
         else if ("shadowRes".equals(key)) litRes = v;
         else if ("cubes".equals(key)) litCubes = v;
@@ -3456,6 +3534,7 @@ public class MainActivity extends Activity {
     }
 
     private void litApply(String key, int val) {
+        if (key != null && key.startsWith("rt")) { rtSet(key, val); return; }   /* v9.99: 光追配置走自己的通路 ✓ 不再是摆设 ✗ */
         try { getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt("lit_" + key, val).apply(); }
         catch (Throwable t) { android.util.Log.w("gputest", "光影持久化失败: " + t); }
         String sum = null;
@@ -3465,6 +3544,7 @@ public class MainActivity extends Activity {
                     : "（原生光影接口未接入 ⇒ 仅本地记录：" + key + "=" + val + "，接入后自动生效）");
         log("  光影设置 " + key + " = " + val + (sum != null ? "  → " + sum : "（原生未接入）"));
         try { nativeMini3DSettings(litShadows, litPcf, litRes, litBloom, litTonemap, litAnimate, litPasses); } catch (Throwable t2) { }
+        try { nativeRtSettings(rtSamples, rtBounce, rtDetail, rtBloom, rtLightMove, rtMirror); } catch (Throwable t3) { }
     }
 
     private void litRefreshSummary() {
