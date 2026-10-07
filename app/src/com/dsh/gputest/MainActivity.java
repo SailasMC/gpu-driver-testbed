@@ -582,7 +582,7 @@ public class MainActivity extends Activity {
      * ========================================================================= */
     private View buildOverviewPage() {
         LinearLayout col = col();
-        ovScore = text("—", 44, C_ACCENT, true);
+        ovScore = text("未跑", 34, C_ACCENT, true);   /* v12.9: 空态文案（不再是孤零零一道破折号 ✗）*/
         ovScore.setGravity(Gravity.CENTER_HORIZONTAL);
         TextView scoreLbl = text("综合分（填充率 + 带宽×100 + 三角形吞吐÷1000）", 11, C_DIM, false);
         scoreLbl.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -1460,9 +1460,9 @@ public class MainActivity extends Activity {
      * ========================================================================= */
     private View buildBenchPage() {
         LinearLayout col = col();
-        benchFill = bigNum("—");
-        benchBlit = bigNum("—");
-        benchDraw = bigNum("—");
+        benchFill = bigNum("未跑");
+        benchBlit = bigNum("未跑");
+        benchDraw = bigNum("未跑");
         col.addView(card(section("单项跑分（每项 5 秒）"),
                 actionBtn("填充率 fill", v -> runBench("fill")),
                 actionBtn("拷贝带宽 blit", v -> runBench("blit")),
@@ -1475,9 +1475,9 @@ public class MainActivity extends Activity {
 
         /* (c)：GPU 时间 / 墙钟 / 占空比 —— 与 glmark2 的 --results fps,cpu,shader 同源：
          * GPU 时间来自时间戳，墙钟含提交/驱动/呈现开销，两个数必须并排看。 */
-        benchGpu  = bigNum("—");
-        benchWall = bigNum("—");
-        benchDuty = bigNum("—");
+        benchGpu  = bigNum("未跑");
+        benchWall = bigNum("未跑");
+        benchDuty = bigNum("未跑");
         col.addView(card(section("GPU 时间 / 墙钟 / 占空比"),
                 numRow("GPU 时间", benchGpu,  "ms"),
                 numRow("墙钟",     benchWall, "s"),
@@ -1492,7 +1492,7 @@ public class MainActivity extends Activity {
         col.addView(card(section("本次口径 / 自证行（原样来自原生）"), benchProof,
                 note("例如 `fill 负载: 全屏三角形 + 每像素 64 次循环` —— 口径写在结果旁边，数字才经得起对比。")));
 
-        benchScore = bigNum("—");
+        benchScore = bigNum("未跑");
         col.addView(card(section("综合分"), benchScore,
                 note("口径（与原生一致）：分 = 填充率 + 带宽×100 + 三角形吞吐÷1000；"
                    + "**失败档按 0 计入**，所以含失败项的分数不可比。")));
