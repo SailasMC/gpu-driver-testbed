@@ -310,6 +310,11 @@ public class MainActivity extends Activity {
     /* v10.3 · 实时监视 */
     private boolean liveOn = false;
     private TextView liveTx;
+    /* v10.4 · 趋势：滚动保存最近 24 次采样（约 48 秒）*/
+    private final java.util.ArrayList<Float> liveHist = new java.util.ArrayList<>();
+    private float liveGpuT = -1f, liveMemMB = -1f;
+    /* v10.7 · 帧统计（gfxinfo）*/
+    private int liveJankPct = -1, liveF50 = -1, liveG50 = -1, liveFrames = -1;
 
     /** 一行离散开关（pill）：键名 / 取值表 / 当前选中。 */
     private static final class LitRow {
@@ -2680,7 +2685,7 @@ public class MainActivity extends Activity {
     private boolean isSystemDriver() { String p = selectedPath(); return p == null || p.equals("system"); }
 
     /* v9.48 · Shizuku/Stellar 探针（经 IShizukuService 公开路径）*/
-    private static final String[] SHZ_CMDS = { "getprop ro.product.model", "getprop ro.board.platform", "getprop ro.hardware", "getprop | grep -i -e gpu -e vulkan -e mali -e mediatek | head -15", "dumpsys SurfaceFlinger | head -12", "dumpsys thermalservice | head -60", "dumpsys gpu | head -30", "cat /proc/meminfo | head -6", "cat /proc/loadavg", "ls /sys/class/devfreq/", "ls /sys/class/thermal/ 2>&1 | head -6", "ls /sys/kernel/ged/ 2>&1 | head -4" };   /* v10.2: + thermalservice/gpu（走 binder，绕开 SELinux ✓）*/
+    private static final String[] SHZ_CMDS = { "getprop ro.product.model", "getprop ro.board.platform", "getprop ro.hardware", "getprop | grep -i -e gpu -e vulkan -e mali -e mediatek | head -15", "dumpsys SurfaceFlinger | head -12", "dumpsys thermalservice | head -60", "dumpsys gpu | head -30", "cat /proc/meminfo | head -6", "cat /proc/loadavg", "ls /sys/class/devfreq/", "ls /sys/class/thermal/ 2>&1 | head -6", "ls /sys/kernel/ged/ 2>&1 | head -4", "dumpsys gfxinfo com.dsh.gputest | head -22" };   /* v10.6: 渲染性能统计（binder 路 ✓）*/   /* v10.2: + thermalservice/gpu（走 binder，绕开 SELinux ✓）*/
 
     private void shizukuProbe() {
         if (!claim("Shizuku 探针")) return;
@@ -2714,7 +2719,47 @@ public class MainActivity extends Activity {
     /* v10.3 · 实时监视（不占 busy 位，可与光追/跑分同时跑 ✓）*/
     private static final String[] LIVE_CMDS = {
         "dumpsys thermalservice | grep -m6 -e Current -e GPU -e CPU",
-        "dumpsys gpu | grep -m3 -e Global -e Driver" };
+        "dumpsys gpu | grep -m3 -e Global -e Driver", "dumpsys gfxinfo com.dsh.gputest | grep -m10 -e Total -e Janky -e percentile" };   /* v10.6: 真渲染性能（帧时间分布/卡顿率）*/
+    /* v10.4 · 趋势解析与绘制（块字符 sparkline ✓ 零依赖 ✓）*/
+    private void liveParse(String t) {
+        try {
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("mValue=([0-9.]+), mType=[0-9]+, mName=GPU").matcher(t);
+            float last = -1f;
+            while (m.find()) last = Float.parseFloat(m.group(1));
+            if (last > 0f) { liveGpuT = last; liveHist.add(last); if (liveHist.size() > 24) liveHist.remove(0); }
+            java.util.regex.Matcher m2 = java.util.regex.Pattern.compile("Global total: ([0-9]+)").matcher(t);
+            if (m2.find()) liveMemMB = Float.parseFloat(m2.group(1)) / 1048576f;
+            java.util.regex.Matcher m3 = java.util.regex.Pattern.compile("Total frames rendered: ([0-9]+)").matcher(t);
+            if (m3.find()) liveFrames = Integer.parseInt(m3.group(1));
+            java.util.regex.Matcher m4 = java.util.regex.Pattern.compile("Janky frames: [0-9]+ .([0-9.]+)%.*").matcher(t);   /* v10.9: 无反斜杠正则（heredoc 会吃反斜杠 ✗）*/
+            if (m4.find()) liveJankPct = (int) Float.parseFloat(m4.group(1));
+            java.util.regex.Matcher m5 = java.util.regex.Pattern.compile("50th percentile: ([0-9]+)ms").matcher(t);
+            if (m5.find()) liveF50 = Integer.parseInt(m5.group(1));
+            java.util.regex.Matcher m6 = java.util.regex.Pattern.compile("50th gpu percentile: ([0-9]+)ms").matcher(t);
+            if (m6.find()) liveG50 = Integer.parseInt(m6.group(1));
+        } catch (Throwable ignored) { }
+    }
+    private String liveRender() {
+        StringBuilder b = new StringBuilder();
+        b.append("GPU 温度：").append(liveGpuT > 0 ? String.format(java.util.Locale.US, "%.1f °C", liveGpuT) : "（等待首次采样…）").append("");
+        if (liveHist.size() >= 2) {
+            float mn = 999f, mx = -999f;
+            for (float v : liveHist) { if (v < mn) mn = v; if (v > mx) mx = v; }
+            String[] sp = { "_", ".", "-", "=", "+", "*", "#", "@" };
+            b.append("趋势（最近 ").append(liveHist.size()).append(" 次）：");
+            for (float v : liveHist) {
+                int k = (mx - mn) < 0.01f ? 3 : (int) ((v - mn) / (mx - mn) * 7f + 0.5f);
+                if (k < 0) k = 0; if (k > 7) k = 7;
+                b.append(sp[k]);
+            }
+            b.append(String.format(java.util.Locale.US, "   最低 %.1f / 最高 %.1f °C", mn, mx));
+        }
+        if (liveMemMB > 0f) b.append(String.format(java.util.Locale.US, "GPU 显存：%.0f MB", liveMemMB));
+        if (liveFrames > 0) b.append(String.format(java.util.Locale.US, "帧：%d 帧 · 卡顿 %d%% · 帧时间 50th %dms · GPU 50th %dms", liveFrames, liveJankPct, liveF50, liveG50));
+        b.append("");
+        return b.toString();
+    }
+
     private void liveToggle() {
         liveOn = !liveOn;
         setStatus(liveOn ? "实时监视：开（2 秒一次）" : "实时监视：关", liveOn ? C_OK : C_NEUTRAL);
@@ -2730,7 +2775,7 @@ public class MainActivity extends Activity {
                 else { StringBuilder sb = new StringBuilder(); for (String c : LIVE_CMDS) sb.append(runShizuku(svc, c)); txt = sb.toString(); }
             } catch (Throwable t) { txt = "X " + t; }
             final String ft = txt;
-            ui.post(() -> { if (liveTx != null) liveTx.setText(ft); });
+            ui.post(() -> { liveParse(ft); if (liveTx != null) liveTx.setText(liveRender()); });   /* v10.4 解析 + 画趋势 */
             ui.postDelayed(() -> liveTick(), 2000);
         }, "live-poll").start();
     }
