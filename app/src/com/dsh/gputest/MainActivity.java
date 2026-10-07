@@ -2685,7 +2685,7 @@ public class MainActivity extends Activity {
     private boolean isSystemDriver() { String p = selectedPath(); return p == null || p.equals("system"); }
 
     /* v9.48 · Shizuku/Stellar 探针（经 IShizukuService 公开路径）*/
-    private static final String[] SHZ_CMDS = { "getprop ro.product.model", "getprop ro.board.platform", "getprop ro.hardware", "getprop | grep -i -e gpu -e vulkan -e mali -e mediatek | head -15", "dumpsys SurfaceFlinger | head -12", "dumpsys thermalservice | head -60", "dumpsys gpu | head -30", "cat /proc/meminfo | head -6", "cat /proc/loadavg", "ls /sys/class/devfreq/", "ls /sys/class/thermal/ 2>&1 | head -6", "ls /sys/kernel/ged/ 2>&1 | head -4", "dumpsys gfxinfo com.dsh.gputest | head -22" };   /* v10.6: 渲染性能统计（binder 路 ✓）*/   /* v10.2: + thermalservice/gpu（走 binder，绕开 SELinux ✓）*/
+    private static final String[] SHZ_CMDS = { "getprop ro.product.model", "getprop ro.board.platform", "getprop ro.hardware", "getprop | grep -i -e gpu -e vulkan -e mali -e mediatek | head -15", "dumpsys SurfaceFlinger | head -12", "dumpsys thermalservice | head -60", "dumpsys gpu | head -30", "cat /proc/meminfo | head -6", "cat /proc/loadavg", "ls /sys/class/devfreq/", "ls /sys/class/thermal/ 2>&1 | head -6", "ls /sys/kernel/ged/ 2>&1 | head -4", "dumpsys gfxinfo com.dsh.gputest | head -22", "dumpsys meminfo com.dsh.gputest | head -16", "dumpsys battery | head -12" };   /* v11.5: 本 App 内存 + 电池温度（binder 路 ✓）*/   /* v10.6: 渲染性能统计（binder 路 ✓）*/   /* v10.2: + thermalservice/gpu（走 binder，绕开 SELinux ✓）*/
 
     private void shizukuProbe() {
         if (!claim("Shizuku 探针")) return;
@@ -2719,7 +2719,7 @@ public class MainActivity extends Activity {
     /* v10.3 · 实时监视（不占 busy 位，可与光追/跑分同时跑 ✓）*/
     private static final String[] LIVE_CMDS = {
         "dumpsys thermalservice | grep -m6 -e Current -e GPU -e CPU",
-        "dumpsys gpu | grep -m3 -e Global -e Driver", "dumpsys gfxinfo com.dsh.gputest | grep -m10 -e Total -e Janky -e percentile" };   /* v10.6: 真渲染性能（帧时间分布/卡顿率）*/
+        "dumpsys gpu | grep -m3 -e Global -e Driver", "dumpsys gfxinfo com.dsh.gputest | grep -m10 -e Total -e Janky -e percentile", "dumpsys meminfo com.dsh.gputest | grep -m6 -e TOTAL -e Native -e Graphics" };   /* v11.5: 实时也带内存 ✓ */   /* v10.6: 真渲染性能（帧时间分布/卡顿率）*/
     /* v10.4 · 趋势解析与绘制（块字符 sparkline ✓ 零依赖 ✓）*/
     private void liveParse(String t) {
         try {
@@ -2758,6 +2758,42 @@ public class MainActivity extends Activity {
         if (liveFrames > 0) b.append(String.format(java.util.Locale.US, "帧：%d 帧 · 卡顿 %d%% · 帧时间 50th %dms · GPU 50th %dms", liveFrames, liveJankPct, liveF50, liveG50));
         b.append("");
         return b.toString();
+    }
+
+    /* v11.0 · 跑分 HTML 报告：成绩 + 温度趋势图 + 帧统计 + 设备信息（内联样式，零依赖 ✓）*/
+    private void exportHtmlReport() {
+        try {
+            char NL = (char) 10;
+            StringBuilder h = new StringBuilder();
+            h.append("<!doctype html><meta charset=utf-8><title>GPU 驱动测试台 报告</title>");
+            h.append("<style>body{font-family:sans-serif;background:#101216;color:#e8e8e8;padding:18px}");
+            h.append("h2{color:#4ea1ff}pre{background:#1a1d23;padding:10px;border-radius:8px;overflow:auto;font-size:12px}");
+            h.append("table{border-collapse:collapse}td,th{border:1px solid #333;padding:6px 10px;font-size:13px}");
+            h.append("</style><h2>GPU 驱动测试台 · 报告</h2>");
+            h.append("<div>生成时间：").append(new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US).format(new java.util.Date())).append("</div>");
+            h.append("<div>机型：").append(android.os.Build.MODEL).append(" · 平台：").append(android.os.Build.HARDWARE).append(" · Android ").append(android.os.Build.VERSION.RELEASE).append("</div>");
+            h.append("<h3>成绩</h3><pre>").append(scoreTable == null ? "（本次无成绩）" : scoreTable.getText().toString()).append("</pre>");
+            h.append("<h3>光追配置快照</h3><table><tr><th>阴影采样</th><th>反射弹射</th><th>材质细节</th><th>光晕</th><th>灯绕行</th><th>镜面率</th></tr><tr><td>").append(rtSamples).append("</td><td>").append(rtBounce).append("</td><td>").append(rtDetail == 1 ? "开" : "关").append("</td><td>").append(rtBloom).append("%</td><td>").append(rtLightMove).append("</td><td>").append(rtMirror).append("%</td></tr></table>");
+            h.append("<h3>帧统计</h3><table><tr><th>总帧数</th><th>卡顿率</th><th>帧时间 50th</th><th>GPU 50th</th></tr><tr><td>").append(liveFrames).append("</td><td>").append(liveJankPct).append("%</td><td>").append(liveF50).append("ms</td><td>").append(liveG50).append("ms</td></tr></table>");
+            h.append("<h3>GPU 温度趋势</h3>");
+            if (liveHist.size() > 0) {
+                float mn = 999f, mx = -999f;
+                for (float v : liveHist) { if (v < mn) mn = v; if (v > mx) mx = v; }
+                h.append("<div>最低 ").append(String.format(java.util.Locale.US, "%.1f", mn)).append(" °C · 最高 ").append(String.format(java.util.Locale.US, "%.1f", mx)).append(" °C · 样本 ").append(liveHist.size()).append("</div>");
+                h.append("<div style=&apos;height:120px;display:flex;align-items:flex-end;gap:2px;background:#1a1d23;padding:8px;border-radius:8px&apos;>");
+                for (float v : liveHist) {
+                    int hh = (mx - mn) < 0.01f ? 60 : (int) (10 + 100 * (v - mn) / (mx - mn));
+                    h.append("<div style=&apos;width:12px;height:").append(hh).append("px;background:linear-gradient(#ff9d4e,#4ea1ff);border-radius:2px&apos;></div>");
+                }
+                h.append("</div>");
+            } else h.append("<div>（无采样：请先在设置页开启实时监视）</div>");
+            h.append("<h3>设备真实数据（Shizuku 探针原文）</h3><pre>").append(shzDataText.length() == 0 ? "（未运行探针）" : shzDataText).append("</pre>");
+            String ts = new java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(new java.util.Date());
+            String path = "/sdcard/Download/gputest-report-" + ts + ".html";
+            java.io.FileWriter fw = new java.io.FileWriter(path);
+            fw.write(h.toString()); fw.close();
+            setStatus("报告已导出：" + path, C_OK); log("  HTML 报告 -> " + path);
+        } catch (Throwable t) { setStatus("报告导出失败: " + t, C_BAD); log("  X 报告导出失败: " + t); }
     }
 
     private void liveToggle() {
@@ -2857,6 +2893,7 @@ public class MainActivity extends Activity {
                 liveTx,
                 note("每 2 秒调用 dumpsys thermalservice / gpu（binder 路，绕开 SELinux ✓）—— 开着光追时点开，就能看到温度随负载上升 ✓"),
                 btnTonal("▶ 开始 / ■ 停止 实时监视", v -> liveToggle())));
+        col.addView(btnTonal("导出 HTML 报告（成绩+温度趋势+帧统计）", v -> exportHtmlReport()));   /* v11.0 */
 
         col.addView(section("渲染"));
         col.addView(btnTonal("帧率上限：30fps / 不限（点击切换）", v -> {
@@ -3945,7 +3982,7 @@ public class MainActivity extends Activity {
         col.addView(card(section("导出"),
                 btnPrimary("导出 / 分享日志", v -> exportLog()),
                 btnTonal("复制设备信息", v -> copyDeviceInfo()),
-                note("HTML 报告（含内联图表）正在开发中，敬请期待。")));
+                note("HTML 报告：到「设置 → 导出 HTML 报告」一键生成（成绩 + 温度趋势柱状图 + 帧统计 + 光追配置快照）✓")));
         return scroll(col);
     }
 

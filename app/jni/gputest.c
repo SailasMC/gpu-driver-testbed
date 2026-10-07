@@ -1216,6 +1216,15 @@ Java_com_dsh_gputest_MainActivity_nativeRtBlit(JNIEnv *env, jobject th, jobject 
     if (!g_rtx.ok || !g_rtx.rbuf) return (*env)->NewStringUTF(env, "光追无图像");
     AndroidBitmapInfo info;
     if (AndroidBitmap_getInfo(env, bmp, &info) != ANDROID_BITMAP_RESULT_SUCCESS) return (*env)->NewStringUTF(env, "取位图信息失败");
+    /* v11.4 · 回读节流：原生每帧都拷 4 MB，而 UI 侧有 70ms 节流 ⇒ 大部分拷贝白做 ✗
+     * 只在足够大的分辨率下、且距上次回读 >60ms 时才真拷（小分辨率照旧 ✓ 不影响诊断）*/
+    {
+        static double lastBlit = 0.0;
+        double nowb = now_ms();
+        if (g_rtx.w * g_rtx.h >= 512 * 512 && (nowb - lastBlit) < 60.0)
+            return (*env)->NewStringUTF(env, "回读跳过（UI 未消费，省一次 4MB 拷贝）");
+        lastBlit = nowb;
+    }
     void *pix = NULL;
     if (AndroidBitmap_lockPixels(env, bmp, &pix) != ANDROID_BITMAP_RESULT_SUCCESS) return (*env)->NewStringUTF(env, "锁定位图失败");
     double pmin = -1, pmax = -1, pavg = -1;   /* v9.65 */
