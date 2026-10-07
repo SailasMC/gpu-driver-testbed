@@ -10,6 +10,7 @@ layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1, rgba8) uniform image2D outImg;
 layout(set = 0, binding = 2) readonly buffer SceneV { float sv[]; };   /* S1b 顶点 */
 layout(set = 0, binding = 3) readonly buffer SceneI { uint si[]; };    /* S1b 索引 */
+layout(set = 0, binding = 4, rgba8) readonly uniform image2D bloomImg;   /* v13.2 泛光图（1/2 分辨率，暂全黑 ⇒ 画面不变 ✓）*/
 layout(push_constant) uniform PC {
     vec4  right;
     vec4  up;
@@ -204,8 +205,23 @@ void main() {
             /* 光晕：与法线无关、随距离衰减 —— 泛光的廉价近似 ✓ */
             /* v11.6 · 双叶光晕（近距紧 + 宽域松）=> 更接近真泛光的观感 ✓ */
             float w2 = float(pc.rtOpt.w) / 100.0;
-            float halo = (LI / (1.0 + 2.2 * d2) + 0.55 * LI / (1.0 + 0.9 * d)) * w2;
+            /* v13.0 · 泛光第一步：亮部门限（软膝）—— 只让【亮】的像素外溢 ✓
+             * 这是泛光的核心语义：能量来自亮部，暗部不发光 ✗→✓
+             * 下一步（施工单）：改为真两趟（亮部提取到 1/2 图 → 可分离高斯 → 合成）*/
+            float lum = dot(base, vec3(0.30, 0.60, 0.10));      /* 亮度（近似 Rec.709 权重）*/
+            float bright = smoothstep(0.45, 1.30, lum);          /* 软膝：暗部 0、亮部 1 ✓ */
+            float halo = (LI / (1.0 + 2.2 * d2) + 0.55 * LI / (1.0 + 0.9 * d)) * w2 * bright;
             base += vec3(1.0, 0.86, 0.62) * halo * 0.55;
+        }
+        /* v13.2 · 读泛光图并叠加（当前该图未被写入 ⇒ 全黑 ⇒ 加 0 ⇒ 画面与上一版一致 ✓）
+         * 下一轮：加 bloom 管线 + dispatch 后，这里就变成真泛光 ✓ */
+        {
+            ivec2 bp2 = ivec2(gl_GlobalInvocationID.xy) / 2;
+            ivec2 bsz = imageSize(bloomImg);
+            if (bp2.x >= 0 && bp2.y >= 0 && bp2.x < bsz.x && bp2.y < bsz.y) {
+                vec3 bl = imageLoad(bloomImg, bp2).rgb;
+                base += bl * (float(pc.rtOpt.w) / 100.0) * 1.6;
+            }
         }
         col = base;   /* v9.97: 撤掉多余的压暗 —— base 里已含 97% 反射（fres=0.97）⇒ 镜子本身就是反射像 ✓ */
     }

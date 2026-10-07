@@ -96,7 +96,7 @@ public class MainActivity extends Activity {
     public native String nativeMini3DFrame(Bitmap bmp);                   /* v9.11 (Landroid/graphics/Bitmap;)Ljava/lang/String; */
     public native void   nativeMini3DStop();
     public native void   nativeMini3DSettings(int shadows, int pcf, int res, int bloom, int tonemap, int animate, int passes);
-    public native void   nativeRtSettings(int samples, int bounce, int detail, int bloomPct, int lightMove, int mirrorPct);   /* v9.98 */                              /* v9.11 ()V */
+    public native void   nativeRtSettings(int samples, int bounce, int detail, int bloomPct, int lightMove, int mirrorPct, int thresh, int radius);   /* v13.4 */                              /* v9.11 ()V */
     public native String nativeLitBlit(Bitmap bmp);                 /* (jobject) */
     public native void   nativeLitStop();                           /* () */
     /* v7.0 光追能力探测（原生已可用）。注意：**不声明**尚未导出的 RtInit/RtFrame
@@ -303,7 +303,7 @@ public class MainActivity extends Activity {
     private int litShadows = 1, litPcf = 3, litRes = 2048, litCubes = 36,
                 litBloom = 1, litTonemap = 1, litPasses = 1, litDebug = 0, litAnimate = 1;
     /* v9.98 · 光追配置 */
-    private int rtSamples = 4, rtBounce = 1, rtDetail = 1, rtBloom = 100, rtLightMove = 1, rtMirror = 97;
+    private int rtSamples = 4, rtBounce = 1, rtDetail = 1, rtBloom = 100, rtLightMove = 1, rtMirror = 97, rtThresh = 60, rtRadius = 3;   /* v13.4 +泛光阈值/半径 */
     /* v10.1 · 真实数据面板 */
     private String shzDataText = "";
     private TextView shzDataTx;
@@ -3243,6 +3243,12 @@ public class MainActivity extends Activity {
         fxGroup.addView(litSwitch("rtDetail", "材质细节（程序化）", "木纹/板缝/锈斑/砖缝/污渍；关掉可对比细节值多少帧", rtDetail));
         fxGroup.addView(litPills("rtBloom", "光晕强度", new int[]{0, 50, 100, 200},
                 new String[]{"关", "50%", "100%", "200%"}, rtBloom, "灯周围的亮部外溢强度（泛光的解析近似）"));
+        fxGroup.addView(litPills("rtThresh", "泛光亮部阈值", new int[]{20, 40, 60, 80},
+                new String[]{"0.2", "0.4", "0.6", "0.8"}, rtThresh,
+                "亮度超过该值才外溢：低=更多亮部参与（更亮更糊），高=只有最亮点晕开 ✓"));
+        fxGroup.addView(litPills("rtRadius", "泛光半径", new int[]{1, 2, 3, 4, 6},
+                new String[]{"1", "2", "3", "4", "6"}, rtRadius,
+                "亮部晕开的范围（1/2 分辨率上采样 ⇒ 实际观感更大）：越大越柔、耗时略升 ✓"));
         fxGroup.addView(litPills("rtLightMove", "灯绕行速度", new int[]{0, 1, 2},
                 new String[]{"静止", "慢", "快"}, rtLightMove,
                 "静止 = 画面不变，可逐像素比对；慢/快 = 实时渲染演示（阴影与反射逐帧变化）"));
@@ -3605,7 +3611,9 @@ public class MainActivity extends Activity {
         else if ("rtBloom".equals(key)) rtBloom = v;
         else if ("rtLightMove".equals(key)) rtLightMove = v;
         else if ("rtMirror".equals(key)) rtMirror = v;
-        try { nativeRtSettings(rtSamples, rtBounce, rtDetail, rtBloom, rtLightMove, rtMirror); } catch (Throwable t4) { }
+        else if ("rtThresh".equals(key)) rtThresh = v;
+        else if ("rtRadius".equals(key)) rtRadius = v;
+        try { nativeRtSettings(rtSamples, rtBounce, rtDetail, rtBloom, rtLightMove, rtMirror, rtThresh, rtRadius); } catch (Throwable t4) { }
         return v;
     }
 
@@ -3698,7 +3706,7 @@ public class MainActivity extends Activity {
                     : "（原生光影接口未接入 ⇒ 仅本地记录：" + key + "=" + val + "，接入后自动生效）");
         log("  光影设置 " + key + " = " + val + (sum != null ? "  → " + sum : "（原生未接入）"));
         try { nativeMini3DSettings(litShadows, litPcf, litRes, litBloom, litTonemap, litAnimate, litPasses); } catch (Throwable t2) { }
-        try { nativeRtSettings(rtSamples, rtBounce, rtDetail, rtBloom, rtLightMove, rtMirror); } catch (Throwable t3) { }
+        try { nativeRtSettings(rtSamples, rtBounce, rtDetail, rtBloom, rtLightMove, rtMirror, rtThresh, rtRadius); } catch (Throwable t3) { }
     }
 
     private void litRefreshSummary() {

@@ -12,7 +12,8 @@
 #include <vulkan/vulkan.h>
 #include "shaders.h"
 #include "shaders_lit.h"
-#include "shaders_rt.h"   /* 光追 ray_query 计算着色器，已编进 .so ✓ */   /* v7.0：光影四段着色器，已编进 .so ✓ */
+#include "shaders_rt.h"
+#include "shaders_bloom.h"   /* v13.3 泛光趟的 SPIR-V ✓ */   /* 光追 ray_query 计算着色器，已编进 .so ✓ */   /* v7.0：光影四段着色器，已编进 .so ✓ */
 #include "shaders_lit2.h"   /* v7.8：动态 PCF + 线性输出 + 后处理开关 */
 #include "shaders_mini3d.h"   /* v9.11：迷你 3D 自转立方体的 SPIR-V ✓ */
 #include <android/bitmap.h>
@@ -797,7 +798,17 @@ static int rt_make_mesh(Ctx *c, float **vout, uint32_t **iout, uint32_t *ntri, u
 
 
 /* 光追推常量（与 rt.comp 的 push_constant 块逐字段对齐 ✓ 112 字节）*/
-static int g_rt_opt[6] = { 4, 1, 1, 100, 1, 97 };   /* v9.98 光追配置：采样/弹射/细节/光晕/灯速/镜面 */
+/* v13.1 · 泛光第二张图（1/2 分辨率，与施工单一致 ✓）*/
+/* v13.3 · 泛光趟：独立描述符集（b0=源图 b1=目标图）+ 独立管线 ✓ */
+static VkDescriptorSetLayout g_bloomDsl = VK_NULL_HANDLE;
+static VkDescriptorPool g_bloomDpool = VK_NULL_HANDLE;
+static VkDescriptorSet g_bloomDset = VK_NULL_HANDLE;
+static VkPipelineLayout g_bloomPl = VK_NULL_HANDLE;
+static VkPipeline g_bloomPipe = VK_NULL_HANDLE;
+static VkImage g_bloomImg = VK_NULL_HANDLE;
+static VkDeviceMemory g_bloomMem = VK_NULL_HANDLE;
+static VkImageView g_bloomView = VK_NULL_HANDLE;
+static int g_rt_opt[8] = { 4, 1, 1, 100, 1, 97, 60, 3 };   /* v13.4 +泛光阈值/半径 */   /* v9.98 光追配置：采样/弹射/细节/光晕/灯速/镜面 */
 typedef struct { float right[4]; float up[4]; float fwd[4]; float camPos[4]; float lightDir[4]; float light2[4]; float fov; int shadowOn; int bounces; float t; int rtOpt[4]; } RtPC;   /* v9.98: rtOpt[4]，去 _pad ⇒ 124 字节 ✓ */   /* v9.91: +light2 点光源 */   /* v9.69: 传相机基，不再用 invVP ✓ */
 static VkBuffer g_scBuf = VK_NULL_HANDLE, g_scIdx = VK_NULL_HANDLE;        /* v9.90 全局：S1a 写入 / S1b 绑定 跨函数共用 ✓ */
 static VkDeviceMemory g_scBufMem = VK_NULL_HANDLE, g_scIdxMem = VK_NULL_HANDLE;
@@ -957,6 +968,32 @@ Java_com_dsh_gputest_MainActivity_nativeRtInit(JNIEnv *env, jobject th, jstring 
 
 
 /* ---- 光追：TLAS + 存储图像 + 描述符 + compute 管线 + dispatch ---- */
+static int rt_mk_image2(Ctx *c, int w, int h, VkImage *pimg, VkDeviceMemory *pmem, VkImageView *pview) {
+    /* v13.1 · rt_mk_image 的参数化版（供泛光图使用 ✓ 原函数保持不动 ✓）*/
+    PFN_vkCreateImage ci = (PFN_vkCreateImage) c->gdpa(c->dev, "vkCreateImage");
+    PFN_vkGetImageMemoryRequirements gm = (PFN_vkGetImageMemoryRequirements) c->gdpa(c->dev, "vkGetImageMemoryRequirements");
+    PFN_vkAllocateMemory am = (PFN_vkAllocateMemory) c->gdpa(c->dev, "vkAllocateMemory");
+    PFN_vkBindImageMemory bm = (PFN_vkBindImageMemory) c->gdpa(c->dev, "vkBindImageMemory");
+    PFN_vkCreateImageView cv = (PFN_vkCreateImageView) c->gdpa(c->dev, "vkCreateImageView");
+    if (!ci || !gm || !am || !bm || !cv) return 0;
+    VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { (uint32_t) w, (uint32_t) h, 1 },
+        .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (ci(c->dev, &ic, NULL, pimg) != VK_SUCCESS) return 0;
+    VkMemoryRequirements mr; gm(c->dev, *pimg, &mr);
+    uint32_t mt = pick_mem(c, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mt == MEM_NONE) return 0;
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = mt };
+    if (am(c->dev, &ai, NULL, pmem) != VK_SUCCESS) return 0;
+    if (bm(c->dev, *pimg, *pmem, 0) != VK_SUCCESS) return 0;
+    VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = *pimg,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    return cv(c->dev, &vc, NULL, pview) == VK_SUCCESS;
+}
+
 static int rt_mk_image(Ctx *c, int w, int h) {
     PFN_vkCreateImage ci = (PFN_vkCreateImage) c->gdpa(c->dev, "vkCreateImage");
     PFN_vkGetImageMemoryRequirements gm = (PFN_vkGetImageMemoryRequirements) c->gdpa(c->dev, "vkGetImageMemoryRequirements");
@@ -1061,7 +1098,7 @@ static int rt_mk_pipeline(Ctx *c) {
     PFN_vkCreatePipelineLayout mkpl = (PFN_vkCreatePipelineLayout) c->gdpa(c->dev, "vkCreatePipelineLayout");
     PFN_vkCreateComputePipelines mkcp = (PFN_vkCreateComputePipelines) c->gdpa(c->dev, "vkCreateComputePipelines");
     if (!mksh || !mkdl || !mkdp || !ads || !uds || !mkpl || !mkcp) return 0;
-    VkDescriptorSetLayoutBinding b[4];   /* v9.89 S1b: +b2 顶点SSBO +b3 索引SSBO */
+    VkDescriptorSetLayoutBinding b[5];   /* v13.1: +b4 泛光图（1/2 ✓）*/
     memset(b, 0, sizeof(b));
     b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
     b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1071,12 +1108,14 @@ static int rt_mk_pipeline(Ctx *c) {
     b[2].descriptorCount = 1; b[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     b[3].binding = 3; b[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     b[3].descriptorCount = 1; b[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    VkDescriptorSetLayoutCreateInfo dl = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 4, .pBindings = b };
+    b[4].binding = 4; b[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[4].descriptorCount = 1; b[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo dl = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 5, .pBindings = b };
     if (mkdl(c->dev, &dl, NULL, &g_rtx.dsl) != VK_SUCCESS) return 0;
     VkDescriptorPoolSize ps[3] = {
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 } };
-    VkDescriptorPoolCreateInfo dp = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 3, .pPoolSizes = ps };
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2 }, { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 } };
+    VkDescriptorPoolCreateInfo dp = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 4, .pPoolSizes = ps };
     if (mkdp(c->dev, &dp, NULL, &g_rtx.dpool) != VK_SUCCESS) return 0;
     VkDescriptorSetAllocateInfo da = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_rtx.dpool, .descriptorSetCount = 1, .pSetLayouts = &g_rtx.dsl };
     if (ads(c->dev, &da, &g_rtx.dset) != VK_SUCCESS) return 0;
@@ -1084,7 +1123,7 @@ static int rt_mk_pipeline(Ctx *c) {
     wa.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
     wa.accelerationStructureCount = 1; wa.pAccelerationStructures = &g_rtx.tlas;
     VkDescriptorImageInfo ii = { .imageView = g_rtx.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
-    VkWriteDescriptorSet w[4]; memset(w, 0, sizeof(w));
+    VkWriteDescriptorSet w[5]; memset(w, 0, sizeof(w));
     w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].pNext = &wa;
     w[0].dstSet = g_rtx.dset; w[0].dstBinding = 0; w[0].descriptorCount = 1;
     w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -1097,7 +1136,11 @@ static int rt_mk_pipeline(Ctx *c) {
     w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[2].pBufferInfo = &bi2;
     w[3].dstSet = g_rtx.dset; w[3].dstBinding = 3; w[3].descriptorCount = 1;
     w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[3].pBufferInfo = &bi3;
-    uds(c->dev, 4, w, 0, NULL);
+    VkDescriptorImageInfo ib = { .imageView = g_bloomView, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+    w[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[4].dstSet = g_rtx.dset; w[4].dstBinding = 4; w[4].descriptorCount = 1;
+    w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[4].pImageInfo = &ib;
+    uds(c->dev, 5, w, 0, NULL);   /* v13.1: 5 个绑定 ✓ */
     VkShaderModuleCreateInfo sm = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = rt_comp_spv_len * 4, .pCode = rt_comp_spv };
     VkShaderModule mod = NULL;
@@ -1112,6 +1155,43 @@ static int rt_mk_pipeline(Ctx *c) {
         .layout = g_rtx.pl };
     if (mkcp(c->dev, VK_NULL_HANDLE, 1, &cp, NULL, &g_rtx.pipe) != VK_SUCCESS) return 0;
     /* 读回缓冲（主机可见 ✓）*/
+    /* v13.3 · 泛光管线（1/2 分辨率：亮部提取 + 加权模糊 ✓）*/
+    {
+        VkDescriptorSetLayoutBinding bb[2]; memset(bb, 0, sizeof(bb));
+        bb[0].binding = 0; bb[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bb[0].descriptorCount = 1; bb[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bb[1].binding = 1; bb[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bb[1].descriptorCount = 1; bb[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo bdl = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bb };
+        if (mkdl(c->dev, &bdl, NULL, &g_bloomDsl) != VK_SUCCESS) return 0;
+        VkDescriptorPoolSize bps[1] = { { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 } };
+        VkDescriptorPoolCreateInfo bdp = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = bps };
+        if (mkdp(c->dev, &bdp, NULL, &g_bloomDpool) != VK_SUCCESS) return 0;
+        VkDescriptorSetAllocateInfo bda = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_bloomDpool, .descriptorSetCount = 1, .pSetLayouts = &g_bloomDsl };
+        if (ads(c->dev, &bda, &g_bloomDset) != VK_SUCCESS) return 0;
+        VkDescriptorImageInfo bis = { .imageView = g_rtx.view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo bid = { .imageView = g_bloomView, .imageLayout = VK_IMAGE_LAYOUT_GENERAL };
+        VkWriteDescriptorSet bw[2]; memset(bw, 0, sizeof(bw));
+        bw[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; bw[0].dstSet = g_bloomDset; bw[0].dstBinding = 0;
+        bw[0].descriptorCount = 1; bw[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bw[0].pImageInfo = &bis;
+        bw[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; bw[1].dstSet = g_bloomDset; bw[1].dstBinding = 1;
+        bw[1].descriptorCount = 1; bw[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; bw[1].pImageInfo = &bid;
+        uds(c->dev, 2, bw, 0, NULL);
+        VkShaderModuleCreateInfo bsm = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = bloom_spv_len * 4, .pCode = bloom_spv };
+        VkShaderModule bmod = NULL;
+        if (mksh(c->dev, &bsm, NULL, &bmod) != VK_SUCCESS) return 0;
+        VkPushConstantRange bpcr = { .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 16 };
+        VkPipelineLayoutCreateInfo bplci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 1, .pSetLayouts = &g_bloomDsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &bpcr };
+        if (mkpl(c->dev, &bplci, NULL, &g_bloomPl) != VK_SUCCESS) return 0;
+        VkComputePipelineCreateInfo bcp = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                       .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = bmod, .pName = "main" },
+            .layout = g_bloomPl };
+        if (mkcp(c->dev, VK_NULL_HANDLE, 1, &bcp, NULL, &g_bloomPipe) != VK_SUCCESS) return 0;
+        LOG("光追：泛光管线就绪 ✓（1/2 分辨率亮部提取 + 加权模糊）");
+    }
     return mk_buf(c, (VkDeviceSize) g_rtx.w * g_rtx.h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g_rtx.rbuf, &g_rtx.rMem, 1);
 }
 
@@ -1125,6 +1205,8 @@ Java_com_dsh_gputest_MainActivity_nativeRtFrame(JNIEnv *env, jobject th) {
     if (!g_rtx.tlas) {
         if (!rt_build_tlas(c)) return (*env)->NewStringUTF(env, "X TLAS 构建失败 ⇒ 驱动/GPU 侧问题");
         if (!rt_mk_image(c, g_rtx.w, g_rtx.h)) return (*env)->NewStringUTF(env, "X 存储图像创建失败");
+        if (!rt_mk_image2(c, g_rtx.w / 2, g_rtx.h / 2, &g_bloomImg, &g_bloomMem, &g_bloomView)) return (*env)->NewStringUTF(env, "X 泛光图创建失败");
+        LOG("光追：泛光图（1/2 分辨率）已创建 ✓");
         if (!rt_mk_pipeline(c)) return (*env)->NewStringUTF(env, "X 光追管线创建失败");
         LOG("光追：TLAS + 存储图像 + 管线就绪\n");
     }
@@ -1191,6 +1273,16 @@ Java_com_dsh_gputest_MainActivity_nativeRtFrame(JNIEnv *env, jobject th) {
         .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         .image = g_rtx.img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
     bar(g_rtx.cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    /* v13.3 · 泛光趟：在 RT 之后、回读之前 ✓（源图→1/2 亮部图 ✓）*/
+    {
+        int bw2 = g_rtx.w / 2, bh2 = g_rtx.h / 2;
+        int bpx = (bw2 + 7) / 8, bpy = (bh2 + 7) / 8;
+        int bpc[4] = { g_rt_opt[6], g_rt_opt[7], g_rtx.w, g_rtx.h };   /* v13.4 阈值/半径由配置控制 ✓ */
+        bp(g_rtx.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_bloomPipe);
+        bds(g_rtx.cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_bloomPl, 0, 1, &g_bloomDset, 0, NULL);
+        pc_(g_rtx.cb, g_bloomPl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bpc), bpc);
+        disp(g_rtx.cb, (uint32_t) bpx, (uint32_t) bpy, 1);
+    }
     VkBufferImageCopy bc = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
         .imageExtent = { (uint32_t) g_rtx.w, (uint32_t) g_rtx.h, 1 } };
     c2b(g_rtx.cb, g_rtx.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_rtx.rbuf, 1, &bc);
@@ -3468,10 +3560,11 @@ JNIEXPORT jint JNICALL Java_com_dsh_gputest_MainActivity_nativeMini3DInit(JNIEnv
 }
 
 JNIEXPORT void JNICALL Java_com_dsh_gputest_MainActivity_nativeRtSettings(JNIEnv *env, jobject th,
-        jint samples, jint bounce, jint detail, jint bloomPct, jint lightMove, jint mirrorPct) {
+        jint samples, jint bounce, jint detail, jint bloomPct, jint lightMove, jint mirrorPct, jint thresh, jint radius) {
     (void) env; (void) th;
     g_rt_opt[0] = samples; g_rt_opt[1] = bounce; g_rt_opt[2] = detail;
     g_rt_opt[3] = bloomPct; g_rt_opt[4] = lightMove; g_rt_opt[5] = mirrorPct;
+    g_rt_opt[6] = thresh; g_rt_opt[7] = radius;
     snprintf(g_log + g_len, sizeof(g_log) - g_len, "光追配置 -> 采样=%d 弹射=%d 细节=%d 光晕=%d 灯速=%d 镜面=%d", samples, bounce, detail, bloomPct, lightMove, mirrorPct);
     LOG("%s", "\n");
 }
