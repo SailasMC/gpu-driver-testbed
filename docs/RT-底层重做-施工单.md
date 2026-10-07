@@ -77,3 +77,48 @@
 - ✅ 天玑官方最优阴影写法（`TerminateOnFirstHit` + 单次 `Proceed` ✓）
 - ✅ 构建与发布链（`mk.sh` / 通道 / GitHub Release ✓）
 - ✅ 参考实现已就位：`/root/vks`（Khronos Vulkan-Samples，Apache-2.0 ✓）
+
+---
+
+## 七、进度与关键决策（2026-10-07 更新）
+
+### S1 已完成 ✅
+
+| 步 | 状态 | 版本 | 证据 |
+|---|---|---|---|
+| **S1a** 场景数据上传到 Scene SSBO | ✅ | 9.85/9.86 | 日志 `场景 SSBO OK 顶点 6408 字节（534 个）· 索引 10656 字节` |
+| **S1b** 绑定到描述符 `b2` 顶点 / `b3` 索引 | ✅ | 9.90 | 布局 4 绑定 ✓ 池 3 条 ✓ 写入 4 个 ✓ 着色器同名声明 ✓ |
+
+> 踩坑记录（供后续参考）：SSBO 句柄最初写成**函数内 static** ✗ ⇒ 描述符那个函数看不到 ✗ ⇒ 改为**文件作用域** ✓（跨函数共享的资源句柄一律文件级 ✓）
+
+### S2 的关键决策：**几何法线要，但不能全盘替换** ⚠️
+
+技术上 S2 可以这样取真法线（数据已就绪 ✓）：
+
+```glsl
+int prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+uint p3 = uint(prim) * 3u;
+uint i0 = si[p3], i1 = si[p3+1u], i2 = si[p3+2u];
+vec3 v0 = vec3(sv[i0*3u], sv[i0*3u+1u], sv[i0*3u+2u]);   // 顶点已在 SSBO ✓
+vec3 gN = normalize(cross(v1 - v0, v2 - v0));            // 面法线
+```
+
+**但有一个真实的观感权衡**：
+
+| 方案 | 球面观感 | 结构性收益 |
+|---|---|---|
+| **解析法线**（现状 ✓） | **光滑** ✓（球心+半径 现算，逐像素连续 ✓） | ✗ 需要两张表（C 与 GLSL 各一份 ✗ 已坑 4 次 ✓） |
+| **面法线**（SSBO ✓） | **有棱面** ✗（20×10 细分的球，逐三角形平坦 ✗） | ✅ 彻底消除重复（加模型只改一处 ✓） |
+| **顶点法线插值**（最优 ✓） | 光滑 ✓ | ✅ 无重复 ✓ **但需要顶点法线数据** ✗（现在的 SSBO 只有位置，没有法线 ✗） |
+
+### ⇒ 结论：S2 的正确形态 = **给 SSBO 加一列顶点法线**，而不是改用面法线
+
+```
+① rt_make_mesh 生成时顺带输出法线（球：normalize(v − 圆心)；箱：面法线按 6 个面分配 ✓）
+② Scene SSBO 从 [pos] 扩为 [pos | normal]（或第二条 SSBO）
+③ 着色器用 rayQueryGetIntersectionPrimitiveIndexEXT + 重心坐标
+   （rayQueryGetIntersectionBarycentricsEXT ✓）**插值**三个顶点法线 ⇒ 光滑且无重复 ✓
+④ 材质也一并数据化（每三角形一个 materialId ✓ 放进索引缓冲的高位或第三条 SSBO）
+```
+
+**验收判据**：球面观感与现状**同等或更光滑** ✓ + 新增一个箱子只需改 `rt_make_mesh` 一处 ✓（着色器零改动 ✓）
